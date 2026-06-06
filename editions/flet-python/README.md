@@ -19,6 +19,17 @@ the shared Workbench spec at the repo root, not specific to this edition).
 > [Trust mode](#trust-mode--what-the-app-can-do-to-your-machine) section before
 > you turn off mock mode.
 
+## Screenshots
+
+| | |
+| --- | --- |
+| ![Inbox](docs/screenshots/2026-06-06_13-32.png) | ![Project overview](docs/screenshots/2026-06-06_14-20.png) |
+| Sidebar (Home / Inbox / Reviews / areas) + inbox triage list | Project overview — note, working_dir launchers, threads, tasks |
+
+More screens (Home, Reviews board, chat, settings, the vault in Obsidian) are in
+[`docs/screenshots/`](docs/screenshots/). They're real-vault captures from
+day-to-day use, so some content is partially redacted.
+
 ---
 
 ## Requirements
