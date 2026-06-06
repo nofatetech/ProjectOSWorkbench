@@ -1,0 +1,32 @@
+[project]
+name = "projectosworkbenchapp1"
+version = "0.1.0"
+description = "Workbench — a local Flet/Python agent OS over an Obsidian vault (Project OS)"
+readme = "README.md"
+license = "Unlicense"
+requires-python = ">=3.10"
+authors = [
+    { name = "NoFate Technology" }
+]
+dependencies = [
+    "flet>=0.85.2",
+    "python-frontmatter>=1.1.0",
+    "httpx>=0.27.0",
+]
+
+[dependency-groups]
+dev = [
+    "flet-cli>=0.85.2",
+    "flet-desktop>=0.85.2",
+    "flet-web>=0.85.2",
+]
+
+[tool.flet]
+desktop_flavor = "light"    # Change to "full" to use flet-audio and flet-video
+org = "com.nofatetech"
+product = "Workbench"
+company = "NoFate Technology"
+copyright = "Public domain (Unlicense)"
+
+[tool.flet.app]
+path = "src"

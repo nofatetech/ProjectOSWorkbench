@@ -1,0 +1,74 @@
+[
+  {
+    "name": "Newsreader — big & light",
+    "font": "Newsreader",
+    "size": 54,
+    "color": "",
+    "bold": false,
+    "italic": false,
+    "letter_spacing": 0
+  },
+  {
+    "name": "Newsreader — classic bold",
+    "font": "Newsreader",
+    "size": 32,
+    "color": "",
+    "bold": true,
+    "italic": false,
+    "letter_spacing": 0
+  },
+  {
+    "name": "Caveat — handwritten",
+    "font": "Caveat",
+    "size": 60,
+    "color": "#3366CC",
+    "bold": false,
+    "italic": false,
+    "letter_spacing": 0
+  },
+  {
+    "name": "Pacifico — script",
+    "font": "Pacifico",
+    "size": 42,
+    "color": "#B23A48",
+    "bold": false,
+    "italic": false,
+    "letter_spacing": 0
+  },
+  {
+    "name": "Bebas Neue — poster",
+    "font": "Bebas Neue",
+    "size": 64,
+    "color": "",
+    "bold": false,
+    "italic": false,
+    "letter_spacing": 2
+  },
+  {
+    "name": "Lobster — retro",
+    "font": "Lobster",
+    "size": 50,
+    "color": "#2A6F4E",
+    "bold": false,
+    "italic": false,
+    "letter_spacing": 0
+  },
+  {
+    "name": "Fredoka — playful",
+    "font": "Fredoka",
+    "size": 50,
+    "color": "#2A9D8F",
+    "bold": false,
+    "italic": false,
+    "letter_spacing": 0
+  },
+  {
+    "name": "Archivo Black — heavy",
+    "font": "Archivo Black",
+    "size": 40,
+    "color": "#1A1A1A",
+    "bold": false,
+    "italic": false,
+    "letter_spacing": 0
+  }
+]
