@@ -32,11 +32,28 @@ from pathlib import Path
 
 import httpx
 
-# Same resolution as main.py: repo_root/vault is a symlink to the real vault.
-VAULT_PATH = Path(__file__).resolve().parent.parent / "vault"
-INBOX_DIR = VAULT_PATH / "00_Inbox"
-
 CONFIG_PATH = Path.home() / ".workbench" / "telegram.json"
+APP_CONFIG_PATH = Path.home() / ".workbench" / "config.json"
+_REPO_VAULT = Path(__file__).resolve().parent.parent / "vault"
+
+
+def _resolve_vault_path() -> Path:
+    """Resolve the vault the same way the Flet app does: config.json's
+    `vault_path` wins, so the daemon and the app never write to different
+    vaults. Falls back to the repo-local `vault` dir (symlink in dev clones)
+    only when config has no usable path."""
+    try:
+        cfg = json.loads(APP_CONFIG_PATH.read_text())
+        vp = (cfg.get("vault_path") or "").strip()
+        if vp and Path(vp).expanduser().is_dir():
+            return Path(vp).expanduser()
+    except Exception:
+        pass
+    return _REPO_VAULT
+
+
+VAULT_PATH = _resolve_vault_path()
+INBOX_DIR = VAULT_PATH / "00_Inbox"
 API = "https://api.telegram.org/bot{token}/{method}"
 POLL_TIMEOUT = 30  # seconds — long-poll; Telegram holds the request open
 VERBOSE = bool(__import__("os").environ.get("WORKBENCH_TELEGRAM_VERBOSE"))
