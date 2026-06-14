@@ -13,7 +13,7 @@ import shlex
 import subprocess
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -165,6 +165,14 @@ DELEGATE_SCHEMAS = [
             "job_id": {"type": "string"}},
             "required": ["job_id"]}}},
 ]
+
+
+# Tools that change state on disk / spawn processes. The optional confirm dialog
+# (Config.tool_confirm) gates only these; read_vault_note / list_dir are
+# read-only and never prompted. execute_tool itself is unguarded — the gate lives
+# in the dispatch loop, which owns the UI, so this module stays UI-free.
+MUTATING_TOOLS = {"write_vault_note", "move_note", "run_shell",
+                  "delegate_to_claude_code"}
 
 
 def schemas_for(ctx: ToolContext) -> list:

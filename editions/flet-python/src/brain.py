@@ -201,7 +201,7 @@ class OpenRouterBrain(Brain):
                temperature: Optional[float] = None,
                max_tokens: Optional[int] = None) -> Iterator[str]:
         if not self.api_key:
-            yield f"[OpenRouter] no API key set — open Settings to add one."
+            yield "[OpenRouter] no API key set — open Settings to add one."
             return
         try:
             with httpx.Client(timeout=120.0) as client:

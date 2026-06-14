@@ -19,7 +19,35 @@ dev = [
     "flet-cli>=0.85.2",
     "flet-desktop>=0.85.2",
     "flet-web>=0.85.2",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
+
+[tool.ruff]
+# src/ is the app; scripts/ are guards. Generous line length — this code wraps
+# prose-y comments, not golf.
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pyflakes (F) is the load-bearing set for the god-object refactor: undefined
+# names, unused imports, redefinitions — exactly the breakage extraction causes.
+# E/W = pycodestyle essentials; B = bugbear (real foot-guns, not style).
+select = ["F", "E4", "E7", "E9", "W6", "B"]
+ignore = [
+    "E501",  # line length not worth churning prose comments over
+    "B008",  # function-call-in-default — Flet idioms use this deliberately
+]
+
+[tool.mypy]
+# Lenient on purpose: catch real type errors without demanding full annotations
+# on a 6.6k-line file up front. Tighten per-module as the refactor carves pieces.
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+files = ["src"]
 
 [tool.flet]
 desktop_flavor = "light"    # Change to "full" to use flet-audio and flet-video

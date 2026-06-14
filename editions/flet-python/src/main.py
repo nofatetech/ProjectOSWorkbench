@@ -23,7 +23,6 @@ import time
 import uuid
 from datetime import date
 from collections import Counter
-from dataclasses import field
 from pathlib import Path
 from typing import Optional
 
@@ -33,24 +32,21 @@ import frontmatter
 import json
 
 from brain import brain_for, clamp_max_tokens
-from config import (Config, CONFIG_PATH, load_config, save_config,
+from config import (CONFIG_PATH, load_config, save_config,
                     load_telegram_cfg, save_telegram_cfg, load_title_themes)
-from store import save_thread, delete_thread, load_thread_dicts
-from tools import ToolContext, execute_tool, schemas_for
+from store import save_thread, load_thread_dicts
+from tools import ToolContext, execute_tool, schemas_for, MUTATING_TOOLS
 from models import (Agent, Turn, Thread, Area, Project, Task, Note, FileItem,
-                    ProjectContent, InboxItem, VaultEntry, OpenTab, AppState)
-from theme import (STATUS_COLORS, PLATINUM, STICKY_YELLOW, STICKY_BORDER,
-                   _all_border, _bevel, _raised, _recessed, _sticky, _text_on)
+                    InboxItem, VaultEntry, OpenTab)
+from theme import (STATUS_COLORS, PLATINUM, _all_border, _bevel, _raised, _recessed, _sticky)
 from vault import (_DEFAULT_VAULT_PATH, _resolve_vault_path, _load_project_from_md,
-                   _project_id_from_name, _estimate_tokens, _first_body_line,
                    load_inbox_items, load_vault_entries, load_reflections,
-                   _coerce_date, _iso_week, Reflection, append_to_main_note,
+                   _coerce_date, _iso_week, append_to_main_note,
                    create_project_note, promote_to_folder, write_status_review,
-                   load_state_from_vault, _project_base_path, _scan_tasks,
+                   load_state_from_vault, _scan_tasks,
                    toggle_task, scan_project_content)
 from osactions import (_resolve_working_dir, _scan_working_dir, _git_short_status,
-                       _spawn, open_in_editor, open_in_terminal, delegate_in_terminal,
-                       reveal_in_files, _is_git_repo, open_in_git_ui, open_in_obsidian,
+                       open_in_editor, open_in_terminal, reveal_in_files, _is_git_repo, open_in_git_ui, open_in_obsidian,
                        sync_context_symlinks, open_cli_session,
                        list_session_images, import_session_image)
 from telegram_daemon import TelegramDaemon
@@ -85,20 +81,29 @@ TITLE_FONTS = list(FONT_SOURCES.keys())
 # ----------------------------------------------------------------------------
 
 
-def _age_string(ts: float) -> str:
-    """Compact age label for an mtime: just now / 5m / 2h / 3d / 4mo / 2y."""
+def _age_string(ts: float, ago: bool = False) -> str:
+    """Compact age label for an mtime: just now / 5m / 2h 10m / 3d 3h / 4mo 2d / 2y 3mo.
+
+    Past the minute mark each label carries a second, finer unit (when non-zero) so
+    "3d" reads "3d 3h" — coarse-unit-only labels hide up to a full unit of age.
+    Pass ago=True to append " ago" (kept off "just now")."""
     age = time.time() - ts
     if age < 60:
         return "just now"
+    suffix = " ago" if ago else ""
     if age < 3600:
-        return f"{int(age // 60)}m"
+        return f"{int(age // 60)}m{suffix}"
     if age < 86400:
-        return f"{int(age // 3600)}h"
+        h, m = int(age // 3600), int((age % 3600) // 60)
+        return (f"{h}h {m}m" if m else f"{h}h") + suffix
     if age < 86400 * 30:
-        return f"{int(age // 86400)}d"
+        d, h = int(age // 86400), int((age % 86400) // 3600)
+        return (f"{d}d {h}h" if h else f"{d}d") + suffix
     if age < 86400 * 365:
-        return f"{int(age // (86400 * 30))}mo"
-    return f"{int(age // (86400 * 365))}y"
+        mo, d = int(age // (86400 * 30)), int((age % (86400 * 30)) // 86400)
+        return (f"{mo}mo {d}d" if d else f"{mo}mo") + suffix
+    y, mo = int(age // (86400 * 365)), int((age % (86400 * 365)) // (86400 * 30))
+    return (f"{y}y {mo}mo" if mo else f"{y}y") + suffix
 
 
 def _human_size(n: int) -> str:
@@ -990,6 +995,10 @@ class WorkbenchApp:
         )
         # Live "a reply is streaming" indicator (header spinner) + counter.
         self._chat_inflight = 0
+        # Per-thread "always allow this tool" set for the tool-confirm gate (see
+        # _ask_tool_permission). In-memory only — keyed by thread.id, reset on
+        # restart so a fresh session re-asks. {thread_id: {tool_name, …}}.
+        self._tool_allow: dict[str, set] = {}
         # Chat-view repaint coalescing. These flags are touched from BOTH the
         # streaming worker threads and the event loop, so every access is guarded
         # by this lock. `_chat_dirty` = there is unrendered chat state; while a
@@ -1257,6 +1266,10 @@ class WorkbenchApp:
         self.settings_tools_switch = ft.Switch(
             label="Enable tools (read/write/list/move vault files, run shell) — trust mode",
             value=cfg.tools_enabled,
+        )
+        self.settings_tool_confirm_switch = ft.Switch(
+            label="Ask before changes (Allow/Deny dialog on write / move / shell / delegate)",
+            value=getattr(cfg, "tool_confirm", False),
         )
         self.settings_delegate_switch = ft.Switch(
             label="Enable headless delegation tool (chat agent can hand coding tasks to the CLI)",
@@ -1884,7 +1897,7 @@ class WorkbenchApp:
         # Personas the user can invoke are listed in the prompt; nothing to configure here.
         general = self.state.get_agent("Workbench")
         if general:
-            self.team_chip.value = f"Workbench  ·  mention any agent to channel it"
+            self.team_chip.value = "Workbench  ·  mention any agent to channel it"
         else:
             self.team_chip.value = "Workbench (fallback prompt; add _System/Agents/Workbench.md)"
         self.team_chip.color = ft.Colors.OUTLINE
@@ -2658,15 +2671,7 @@ class WorkbenchApp:
         meta_parts = [f"{scan['file_count']} files",
                       _human_size(scan.get("size", 0))]
         if scan.get("last_mtime"):
-            age = time.time() - scan["last_mtime"]
-            if age < 60:
-                meta_parts.append("just now")
-            elif age < 3600:
-                meta_parts.append(f"{int(age // 60)}m ago")
-            elif age < 86400:
-                meta_parts.append(f"{int(age // 3600)}h ago")
-            else:
-                meta_parts.append(f"{int(age // 86400)}d ago")
+            meta_parts.append(_age_string(scan["last_mtime"], ago=True))
         items.append(ft.Text(" · ".join(meta_parts), size=11,
                              color=ft.Colors.OUTLINE))
         if git:
@@ -4470,7 +4475,8 @@ class WorkbenchApp:
                 tooltip="Days window for this column — Enter to apply",
                 on_submit=lambda e, w=which: self._on_review_boundary(w, e),
             )
-        lbl = lambda t: ft.Text(t, size=11, color=PLATINUM["text2"])
+        def lbl(t: str) -> ft.Control:
+            return ft.Text(t, size=11, color=PLATINUM["text2"])
         return ft.Row(
             controls=[lbl("window:  next"), field("n1"), lbl("d  ·  next"),
                       field("n2"), lbl("d")],
@@ -5118,9 +5124,16 @@ class WorkbenchApp:
                         ),
                         self.settings_debug_switch,
                         self.settings_tools_switch,
-                        ft.Text("Tools let the agent act on your vault directly "
-                                "(no confirm). It reads files, writes notes, and runs "
-                                "shell commands in the working_dir.",
+                        ft.Text("Tools let the agent act on your vault directly. It "
+                                "reads files, writes notes, and runs shell commands "
+                                "in the working_dir.",
+                                size=11, color=ft.Colors.OUTLINE),
+                        self.settings_tool_confirm_switch,
+                        ft.Text("On: the agent pauses for an Allow/Deny dialog before "
+                                "each change (write / move / shell / delegate); reads "
+                                "never prompt. Approving offers “always allow in this "
+                                "thread”. Off = trust mode: every call runs, git is "
+                                "your undo.",
                                 size=11, color=ft.Colors.OUTLINE),
                         ft.Container(height=8),
                         ft.Text("DELEGATION (CLI agents)", size=10,
@@ -5748,6 +5761,7 @@ class WorkbenchApp:
         cfg.chat_model = (self.settings_model_field.value or "").strip() or "anthropic/claude-opus-4-7"
         cfg.debug_prompts = bool(self.settings_debug_switch.value)
         cfg.tools_enabled = bool(self.settings_tools_switch.value)
+        cfg.tool_confirm = bool(self.settings_tool_confirm_switch.value)
 
         def _num(field, cast, default, lo=None, hi=None):
             try:
@@ -6330,6 +6344,79 @@ class WorkbenchApp:
         )
         return msgs[0]["content"]
 
+    def _tool_action_summary(self, name: str, args: dict) -> str:
+        """One-line human description of what a tool call will do, for the confirm
+        dialog. Mirrors the friendly verbs used by the inline tool markers."""
+        if name == "write_vault_note":
+            return f"Write file:  {args.get('path', '?')}"
+        if name == "move_note":
+            return f"Move:  {args.get('src', '?')}  →  {args.get('dst', '?')}"
+        if name == "run_shell":
+            return f"Run shell:  {args.get('command', '?')}"
+        if name == "delegate_to_claude_code":
+            return f"Delegate to CLI agent:\n{args.get('task', '?')}"
+        return f"{name}({args})"
+
+    def _ask_tool_permission(self, thread: Thread, name: str, args: dict) -> bool:
+        """Gate a tool call when Config.tool_confirm is on. Returns True to run it,
+        False to decline. Read-only tools and trust mode return True immediately.
+
+        Threading: the dispatch loop runs on a daemon thread that can't show UI in
+        Flet 0.85, so the dialog is marshalled onto the event loop (page.run_task)
+        and this worker thread BLOCKS on an Event until the user answers. The
+        button callbacks (which run on the event loop) record the choice and set
+        the Event, releasing the worker. Fails safe to DENY if the dialog can't be
+        shown."""
+        cfg = self.state.config
+        if not getattr(cfg, "tool_confirm", False) or name not in MUTATING_TOOLS:
+            return True
+        allow = self._tool_allow.setdefault(thread.id, set())
+        if name in allow:
+            return True
+
+        decision = {"allow": False}
+        ev = threading.Event()
+
+        async def _show():
+            try:
+                remember = ft.Checkbox(
+                    label=f"Always allow {name} in this thread", value=False)
+
+                def _decide(ok: bool):
+                    decision["allow"] = ok
+                    if ok and remember.value:
+                        allow.add(name)
+                    self.page.pop_dialog()
+                    ev.set()
+
+                dlg = ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("Allow this action?"),
+                    content=ft.Column([
+                        ft.Text("The Workbench agent wants to:", size=12,
+                                color=ft.Colors.OUTLINE),
+                        ft.Text(self._tool_action_summary(name, args),
+                                selectable=True),
+                        remember,
+                    ], tight=True, spacing=10),
+                    actions=[
+                        ft.TextButton("Deny", on_click=lambda _e: _decide(False)),
+                        ft.FilledButton("Allow", on_click=lambda _e: _decide(True)),
+                    ],
+                )
+                self.page.show_dialog(dlg)
+            except Exception as ex:
+                self._trace(f"tool-confirm dialog failed: {ex!r}")
+                ev.set()  # fail safe → deny (decision stays False)
+
+        try:
+            self.page.run_task(_show)
+        except Exception as ex:
+            self._trace(f"tool-confirm schedule failed: {ex!r}")
+            return False
+        ev.wait()  # block the worker until the user (or the fail-safe) answers
+        return decision["allow"]
+
     def _dispatch_single(self, thread: Thread, team_turn: Turn):
         """One LLM call to the general agent ('Workbench'); other personas referenced
         in its system prompt and channeled in-conversation."""
@@ -6432,7 +6519,10 @@ class WorkbenchApp:
                                     "text_offset": len(accumulated[0])}
                             team_turn.tool_steps.append(step)
                         render()
-                        result = execute_tool(c["name"], args, tool_ctx)
+                        if self._ask_tool_permission(thread, c["name"], args):
+                            result = execute_tool(c["name"], args, tool_ctx)
+                        else:
+                            result = "[user declined this action]"
                         with lock:
                             step["result"] = result
                         render()

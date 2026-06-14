@@ -6,7 +6,7 @@ move secrets to OS keychain (keyring) later if this leaves a personal machine.
 
 import dataclasses
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -57,6 +57,13 @@ class Config:
     # Let the chat agent call tools (read/write/list/move vault files, run_shell).
     # Trust mode — tools act directly on the vault / working_dir.
     tools_enabled: bool = True
+    # When True, prompt before each *mutating* tool call (write_vault_note,
+    # move_note, run_shell, delegate) with an Allow/Deny dialog; read-only tools
+    # (read_vault_note, list_dir) always run. False = trust mode (the locked
+    # default — no prompt, every call runs). Approving a tool offers "always allow
+    # in this thread" so a triage run isn't a click-fest. Per-thread + in-memory:
+    # the remembered set resets on restart (a fresh session re-asks).
+    tool_confirm: bool = False
     # Render assistant replies as Markdown (headings, lists, code, bold) instead of
     # plain text. Toggle live from the chat header; persisted here. User turns stay
     # plain so your own `#`/`*` don't get reinterpreted.

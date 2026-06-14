@@ -5,10 +5,9 @@ takes the vault root (or a concrete path) explicitly, so the same code serves an
 vault the app is pointed at. main.py keeps the live `VAULT_PATH` and passes it in.
 """
 
-import os
 import re
 from datetime import date
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
