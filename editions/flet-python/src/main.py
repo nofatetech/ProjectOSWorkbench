@@ -36,6 +36,7 @@ from config import (CONFIG_PATH, load_config, save_config,
                     load_telegram_cfg, save_telegram_cfg, load_title_themes)
 from store import save_thread, load_thread_dicts
 from tools import ToolContext, execute_tool, schemas_for, MUTATING_TOOLS
+import publish
 from models import (Agent, Turn, Thread, Area, Project, Task, Note, FileItem,
                     InboxItem, VaultEntry, OpenTab)
 from theme import (STATUS_COLORS, PLATINUM, _all_border, _bevel, _raised, _recessed, _sticky)
@@ -45,6 +46,7 @@ from vault import (_DEFAULT_VAULT_PATH, _resolve_vault_path, _load_project_from_
                    create_project_note, promote_to_folder, write_status_review,
                    load_state_from_vault, _scan_tasks,
                    toggle_task, scan_project_content)
+from views.people import PeopleView
 from osactions import (_resolve_working_dir, _scan_working_dir, _git_short_status,
                        open_in_editor, open_in_terminal, reveal_in_files, _is_git_repo, open_in_git_ui, open_in_obsidian,
                        sync_context_symlinks, open_cli_session,
@@ -489,11 +491,8 @@ class WorkbenchApp:
         self.resources_list_col: ft.Column
         self.resources_preview_col: ft.Column
         self.resources_view_body: ft.Control
-        # PeopleView controls
-        self.people_list_col: ft.Column
-        self.people_preview_col: ft.Column
-        self.people_filter_field: ft.TextField
-        self.people_view_body: ft.Control
+        # PeopleView — extracted to views/people.py (owns its own controls)
+        self.people_view = PeopleView(self)
         # HomeView controls
         self.home_content: ft.Column
         self.home_view_body: ft.Control
@@ -523,7 +522,7 @@ class WorkbenchApp:
         self.area_view_body = self._build_area_view_body()
         self.inbox_view_body = self._build_inbox_view_body()
         self.resources_view_body = self._build_resources_view_body()
-        self.people_view_body = self._build_people_view_body()
+        self.people_view.build_body()
         self.home_view_body = self._build_home_view_body()
         self.reviews_view_body = self._build_reviews_view_body()
 
@@ -875,15 +874,6 @@ class WorkbenchApp:
             on_click=lambda e: self._open_resources(),
         )
 
-    def _build_people_sidebar_row(self) -> ft.Container:
-        return self._build_browser_sidebar_row(
-            kind="people", label="People",
-            icon=ft.Icons.PEOPLE_ROUNDED,
-            icon_color=ft.Colors.PURPLE_400,
-            count=len(self.state.people),
-            on_click=lambda e: self._open_people(),
-        )
-
     def _build_main_area(self) -> ft.Container:
         # Folder-tab metaphor:
         #   Tab strip sits on the main_bg ("desk").
@@ -916,6 +906,10 @@ class WorkbenchApp:
             padding=ft.Padding(left=4, top=2, right=4, bottom=2),
             border_radius=6, ink=True,
             tooltip="Rename this thread",
+            # Flex child of the header's left zone: a long title wraps downward
+            # (see _refresh_thread_title) instead of shoving the busy ring and
+            # action buttons off the right edge.
+            expand=True,
         )
         # Clickable: shows the thread's project (→ its overview) or "scratch".
         self.project_chip = ft.Container(
@@ -1039,21 +1033,37 @@ class WorkbenchApp:
             controls=[
                 ft.Container(
                     padding=ft.Padding(left=20, top=8, right=12, bottom=8),
+                    # Two zones: a flexible identity zone (left) that absorbs all
+                    # the width pressure by wrapping a long title, and a fixed
+                    # action zone (right) that is laid out at its natural size and
+                    # so is never clipped — the busy ring + buttons always show.
                     content=ft.Row(
                         controls=[
-                            ft.Icon(icon=ft.Icons.AUTO_AWESOME, size=14,
-                                    color=ft.Colors.TERTIARY),
-                            self.thread_title,
-                            self.project_chip,
-                            self.team_chip,
-                            ft.Container(expand=True),
-                            self.chat_busy_ring,
-                            self.nav_up_btn,
-                            self.nav_down_btn,
-                            self.md_toggle_btn,
-                            self.prompt_edit_btn,
-                            self.debug_prompt_btn,
-                            self.minimap_toggle_btn,
+                            ft.Row(
+                                controls=[
+                                    ft.Icon(icon=ft.Icons.AUTO_AWESOME, size=14,
+                                            color=ft.Colors.TERTIARY),
+                                    self.thread_title,
+                                    self.project_chip,
+                                    self.team_chip,
+                                ],
+                                spacing=6,
+                                expand=True,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
+                            ft.Row(
+                                controls=[
+                                    self.chat_busy_ring,
+                                    self.nav_up_btn,
+                                    self.nav_down_btn,
+                                    self.md_toggle_btn,
+                                    self.prompt_edit_btn,
+                                    self.debug_prompt_btn,
+                                    self.minimap_toggle_btn,
+                                ],
+                                spacing=6, tight=True,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            ),
                         ],
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         spacing=6,
@@ -1190,26 +1200,6 @@ class WorkbenchApp:
         )
         return self._build_browser_view_body(
             self.resources_list_col, self.resources_preview_col,
-        )
-
-    def _build_people_view_body(self) -> ft.Control:
-        self.people_list_col = ft.Column(
-            spacing=2, scroll=ft.ScrollMode.AUTO, expand=True,
-        )
-        self.people_preview_col = ft.Column(
-            spacing=12, scroll=ft.ScrollMode.AUTO, expand=True,
-        )
-        # Filter field — essential with 100+ name stubs migrated from Airtable
-        self.people_filter_field = ft.TextField(
-            hint_text="Filter people…",
-            value=self.state.people_filter,
-            prefix_icon=ft.Icons.SEARCH,
-            dense=True,
-            on_change=self._on_people_filter_change,
-        )
-        return self._build_browser_view_body(
-            self.people_list_col, self.people_preview_col,
-            header_controls=[self.people_filter_field],
         )
 
     def _build_settings_view_body(self) -> ft.Control:
@@ -1577,7 +1567,7 @@ class WorkbenchApp:
             (self.sidebar_inbox_row, self._build_inbox_sidebar_row),
             (self.sidebar_reviews_row, self._build_reviews_sidebar_row),
             (self.sidebar_resources_row, self._build_resources_sidebar_row),
-            (self.sidebar_people_row, self._build_people_sidebar_row),
+            (self.sidebar_people_row, self.people_view.build_sidebar_row),
         ):
             rebuilt = builder()
             target.content = rebuilt.content
@@ -1859,8 +1849,8 @@ class WorkbenchApp:
             self.view_slot.content = self.resources_view_body
             self._refresh_resources_view()
         elif tab.kind == "people":
-            self.view_slot.content = self.people_view_body
-            self._refresh_people_view()
+            self.view_slot.content = self.people_view.body
+            self.people_view.refresh()
         elif tab.kind == "home":
             self.view_slot.content = self.home_view_body
             self._refresh_home_view()
@@ -1884,10 +1874,16 @@ class WorkbenchApp:
     def _refresh_thread_title(self):
         t = self.state.active_thread
         name = t.name if t else "—"
+        # Title text is the flex child so a long name soft-wraps to extra lines
+        # (no_wrap=False, no max_lines → no ellipsis); the pencil affordance stays
+        # pinned beside it. The container's expand=True bounds this Row's width,
+        # which is what lets the Text wrap instead of overflowing.
         self.thread_title.content = ft.Row(
-            [ft.Text(name, size=13, weight=ft.FontWeight.BOLD),
+            [ft.Text(name, size=13, weight=ft.FontWeight.BOLD,
+                     no_wrap=False, expand=True),
              ft.Icon(ft.Icons.EDIT_OUTLINED, size=12, color=ft.Colors.OUTLINE)],
-            spacing=4, tight=True,
+            spacing=4,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
         )
         self.thread_title.on_click = (
             (lambda e, tid=t.id: self._rename_thread_dialog(tid)) if t else None)
@@ -2473,6 +2469,7 @@ class WorkbenchApp:
                 caption="Notes with `type: post` or `type: journal` in the project folder.",
                 project=p,
                 create=[("+ new post", "post"), ("+ new journal", "journal")],
+                publishable=True,
             )
         )
 
@@ -2946,12 +2943,101 @@ class WorkbenchApp:
         if err:
             self._toast(f"open in Obsidian failed: {err}")
 
-    def _toast(self, msg: str):
+    # --- Publish to WordPress.com (v0.10) -----------------------------------
+    def _note_publish_state(self, path: Path) -> tuple[bool, str]:
+        """Read a note's frontmatter for an existing WP publish. Returns
+        (already_published, published_url) — drives the button's create↔update
+        label and the toast's Open action."""
+        try:
+            post = frontmatter.load(str(path))
+            pid = str(post.metadata.get("wp_post_id") or "").strip()
+            url = str(post.metadata.get("published_url") or "").strip()
+            return bool(pid), url
+        except Exception:
+            return False, ""
+
+    def _on_publish_note(self, path: Path):
+        """Confirm, then publish (or update) a note on WordPress.com. Draft-first;
+        the actual network call runs off the UI thread in _do_publish_note."""
+        cfg = self.state.config
+        creds = publish.creds_from_config(cfg)
+        try:
+            creds.validate()
+        except publish.PublishError as ex:
+            self._toast(str(ex))
+            return
+        published, _ = self._note_publish_state(path)
+        default_status = getattr(cfg, "publish_default_status", "draft")
+        site = getattr(cfg, "wpcom_site", "") or "WordPress.com"
+        if published:
+            title, verb, body = ("Update published post",
+                                 "Update",
+                                 f"Push the latest version of “{path.stem}” to its "
+                                 f"existing post on {site}.")
+        else:
+            title, verb, body = ("Publish to web",
+                                 "Publish",
+                                 f"Create a new {default_status} post for “{path.stem}” "
+                                 f"on {site}.")
+
+        def go(_e):
+            self.page.pop_dialog()
+            self._do_publish_note(path, default_status)
+
+        dlg = ft.AlertDialog(
+            title=ft.Text(title),
+            content=ft.Container(width=460, content=ft.Column([
+                ft.Text(body, size=13),
+                ft.Text(f"Status: {default_status}  ·  it stays editable on WP.",
+                        size=11, italic=True, color=ft.Colors.OUTLINE),
+            ], tight=True, spacing=8)),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _e: self.page.pop_dialog()),
+                ft.FilledButton(verb, icon=ft.Icons.PUBLIC, on_click=go),
+            ],
+        )
+        self.page.show_dialog(dlg)
+
+    def _do_publish_note(self, path: Path, default_status: str):
+        """Run the (network) publish off the UI thread; marshal the result toast +
+        a refresh back onto the event loop (Flet 0.85 can't touch UI from a worker
+        thread — mirrors the dispatch / tool-confirm marshaling)."""
+        self._toast("Publishing…")
+        creds = publish.creds_from_config(self.state.config)
+
+        def run():
+            try:
+                res = publish.publish_note(creds, path, default_status=default_status)
+                msg = f"{res.action} ({res.status}): {res.title}"
+                url = res.url
+            except publish.PublishError as ex:
+                msg, url = f"Publish failed: {ex}", ""
+            except Exception as ex:
+                msg, url = f"Publish error: {ex}", ""
+
+            async def _finish():
+                self._toast(msg, url=url or None)
+                self.refresh()  # re-scan disk → button flips create→update
+
+            try:
+                self.page.run_task(_finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _toast(self, msg: str, url: Optional[str] = None):
         # SnackBar is a DialogControl in this Flet (0.85) — show it via
         # show_dialog, not the old page.open(... open=True) API (which silently
-        # failed, so toasts never appeared).
+        # failed, so toasts never appeared). `url` adds an "Open" action button
+        # (used by publish to jump to the live post).
         try:
-            self.page.show_dialog(ft.SnackBar(content=ft.Text(msg)))
+            if url:
+                bar = ft.SnackBar(content=ft.Text(msg), action="Open",
+                                  on_action=lambda _e: self.page.launch_url(url))
+            else:
+                bar = ft.SnackBar(content=ft.Text(msg))
+            self.page.show_dialog(bar)
         except Exception:
             pass
 
@@ -3044,15 +3130,35 @@ class WorkbenchApp:
 
     def _build_notes_section_card(self, *, label: str, icon, notes: list[Note],
                                    caption: str, project: Optional[Project] = None,
-                                   create: Optional[list] = None) -> ft.Control:
+                                   create: Optional[list] = None,
+                                   publishable: bool = False) -> ft.Control:
         """A notes dashboard section. `caption` is always shown (the convention,
         e.g. "Notes with type: post"). `create` = list of (button_label,
-        note_type) → buttons that create a typed note in the project folder."""
+        note_type) → buttons that create a typed note in the project folder.
+        `publishable` → each row gets a Publish-to-web / Update-published button."""
         header = self._section_card_header(label, icon, len(notes))
         items: list[ft.Control] = [
             ft.Text(caption, size=11, italic=True, color=ft.Colors.OUTLINE),
         ]
         for n in notes[:5]:
+            hdr_controls: list[ft.Control] = [
+                ft.Icon(icon=ft.Icons.DESCRIPTION_OUTLINED,
+                        size=14, color=ft.Colors.OUTLINE),
+                ft.Text(n.name, size=13, weight=ft.FontWeight.BOLD),
+                ft.Container(expand=True),
+                ft.Text(n.note_type, size=10,
+                        color=ft.Colors.OUTLINE, italic=True),
+            ]
+            if publishable:
+                pub, _purl = self._note_publish_state(Path(n.path))
+                hdr_controls.append(ft.IconButton(
+                    icon=ft.Icons.CLOUD_DONE_OUTLINED if pub else ft.Icons.PUBLIC,
+                    icon_size=16,
+                    icon_color=ft.Colors.PRIMARY if pub else ft.Colors.OUTLINE,
+                    tooltip=("Update published post on WordPress"
+                             if pub else "Publish to web (draft) on WordPress"),
+                    on_click=lambda e, pth=Path(n.path): self._on_publish_note(pth),
+                ))
             items.append(
                 ft.Container(
                     padding=ft.Padding(left=10, top=6, right=10, bottom=6),
@@ -3064,14 +3170,7 @@ class WorkbenchApp:
                         spacing=2,
                         controls=[
                             ft.Row(
-                                controls=[
-                                    ft.Icon(icon=ft.Icons.DESCRIPTION_OUTLINED,
-                                            size=14, color=ft.Colors.OUTLINE),
-                                    ft.Text(n.name, size=13, weight=ft.FontWeight.BOLD),
-                                    ft.Container(expand=True),
-                                    ft.Text(n.note_type, size=10,
-                                            color=ft.Colors.OUTLINE, italic=True),
-                                ],
+                                controls=hdr_controls,
                                 spacing=6,
                                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
@@ -3893,7 +3992,7 @@ class WorkbenchApp:
             )
         )
 
-    # --- ResourcesView / PeopleView refresh ---
+    # --- ResourcesView refresh (PeopleView lives in views/people.py) ---
     def _refresh_resources_view(self):
         self._refresh_browser_list(
             list_col=self.resources_list_col,
@@ -3914,35 +4013,6 @@ class WorkbenchApp:
                        "Anything in vault/30_Resources/ shows here."),
             no_selection_msg="Select a resource to preview it here.",
         )
-
-    def _refresh_people_view(self):
-        self._refresh_browser_list(
-            list_col=self.people_list_col,
-            entries=self._filtered_people(),
-            label="People",
-            icon=ft.Icons.PEOPLE_OUTLINE,
-            selected_path=self.state.selected_person_path,
-            on_select=self._on_people_select,
-            on_refresh=self._on_people_refresh,
-            empty_hint=("No matches." if self.state.people_filter
-                        else "No notes in vault/40_People/."),
-            total_count=len(self.state.people),
-        )
-        self._refresh_browser_preview(
-            preview_col=self.people_preview_col,
-            entries=self.state.people,
-            selected_path_attr="selected_person_path",
-            on_close=self._on_people_close_preview,
-            empty_msg=("No people yet.\n\n"
-                       "Anything in vault/40_People/ shows here."),
-            no_selection_msg="Select a person to preview it here.",
-        )
-
-    def _filtered_people(self) -> list[VaultEntry]:
-        q = self.state.people_filter.strip().lower()
-        if not q:
-            return self.state.people
-        return [p for p in self.state.people if q in p.name.lower()]
 
     def _refresh_browser_list(
         self, *, list_col: ft.Column, entries: list[VaultEntry],
@@ -5324,9 +5394,6 @@ class WorkbenchApp:
     def _open_resources(self):
         self._open_or_focus(OpenTab(kind="resources", ref_id="resources"))
 
-    def _open_people(self):
-        self._open_or_focus(OpenTab(kind="people", ref_id="people"))
-
     def _on_resources_select(self, path: str):
         self.state.selected_resource_path = path
         self._refresh_resources_view()
@@ -5344,28 +5411,15 @@ class WorkbenchApp:
         self._refresh_resources_view()
         self.page.update()
 
-    def _on_people_select(self, path: str):
-        self.state.selected_person_path = path
-        self._refresh_people_view()
-        self.page.update()
-
-    def _on_people_refresh(self):
+    def reload_people(self):
+        """Reload 40_People/ from disk + drop a stale selection, then refresh.
+        Stays on the app (owns VAULT_PATH + the global refresh); called by
+        PeopleView.on_refresh."""
         self.state.people = load_vault_entries(VAULT_PATH, "40_People")
         if self.state.selected_person_path and not any(
                 p.path == self.state.selected_person_path for p in self.state.people):
             self.state.selected_person_path = None
         self.refresh()
-
-    def _on_people_close_preview(self):
-        self.state.selected_person_path = None
-        self._refresh_people_view()
-        self.page.update()
-
-    def _on_people_filter_change(self, e):
-        self.state.people_filter = e.control.value or ""
-        # Filter only narrows the list; selection + preview stay as-is even if hidden.
-        self._refresh_people_view()
-        self.page.update()
 
     def _on_inbox_select(self, path: str):
         self.state.selected_inbox_path = path

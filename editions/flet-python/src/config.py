@@ -90,6 +90,20 @@ class Config:
     delegate_terminal_command: str = (
         "gnome-terminal --working-directory={dir} -- bash -c '{cmd}; exec bash'"
     )
+    # --- Publishing to WordPress.com (REST v1.1, OAuth2 password grant) ---
+    # See publish.py. Single-user "password grant": these credentials mint a
+    # Bearer token directly (no browser redirect). client_id/secret come from a
+    # registered app at developer.wordpress.com/apps (Type = Web). If the account
+    # has 2FA, `wpcom_password` must be a WordPress.com Application Password.
+    # Secrets live here (chmod 600), never in the vault/repo.
+    wpcom_site: str = ""           # e.g. "myweb1712.wordpress.com" (the REST <site>)
+    wpcom_client_id: str = ""
+    wpcom_client_secret: str = ""
+    wpcom_username: str = ""
+    wpcom_password: str = ""       # WP.com password, or an Application Password if 2FA
+    # Default publish status when a note has no `publish:` field. Draft-first is
+    # the safe default — nothing goes live by accident; review on WP, then publish.
+    publish_default_status: str = "draft"  # draft | publish
     # Git TUI launched by the "Open in lazygit" buttons (vault on Home + each
     # project's working_dir card). It's a terminal app, so it rides the same
     # interactive terminal template above ({dir}/{cmd}). Swap for gitui/tig/etc.

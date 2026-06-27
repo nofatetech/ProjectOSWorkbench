@@ -136,6 +136,10 @@ accepts any Material icon name (`smart_toy`, `face`, `psychology`, …).
   grid that seeds weekly-review threads.
 - **Demand probes.** `active` projects tagged `demand-probe` get their own Home
   section, sorted stalest-first. (See `docs/vault-conventions.md`.)
+- **Publish to the web.** A button on a project's posts/journals publishes a note
+  to WordPress.com (REST v1.1, draft-first). The result is written back into the
+  note's own frontmatter (`wp_post_id` / `published_url`), so re-publishing
+  *updates* the same post instead of duplicating it.
 - **Themeable.** Light "Platinum" surface theme + configurable title styles.
 
 ## Tools
@@ -218,6 +222,8 @@ conversation is a `parent_id` tree (branches, pins, regenerate).
 | `brain.py` | model routing + streaming (Mock / OpenRouter / Ollama) + tool-call parsing |
 | `tools.py` | the agent's tool registry + execution + CLI delegation |
 | `vault.py` | read/write/scan layer over the vault |
+| `publish.py` | publish a note to WordPress.com (REST v1.1, draft-first, frontmatter writeback) |
+| `views/people.py` | the People directory view |
 | `store.py` | thread persistence (JSON) |
 | `config.py` | `~/.workbench/config.json` + title-theme presets |
 | `osactions.py` | OS/shell launchers (editor, terminal, file manager, git UI) |
