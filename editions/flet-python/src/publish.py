@@ -301,6 +301,39 @@ def _explain_token_error(r: httpx.Response) -> str:
     return f"Auth failed ({err or 'HTTP ' + str(r.status_code)}): {desc}{hint}"
 
 
+def get_post(creds: WPCreds, post_id: str, *, timeout: float = 30.0) -> dict:
+    """Fetch a post's current live state (update preflight, so we don't clobber a
+    status/visibility set on WP). Returns {status, status_intent, password,
+    visibility, url, title}. `status_intent` is draft|publish for the UI dropdown
+    (private/future/pending → publish). Raises PublishError."""
+    creds.validate()
+    token = mint_token(creds, timeout=timeout)
+    try:
+        r = httpx.get(f"{API_BASE}/sites/{creds.site}/posts/{post_id}",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    except httpx.HTTPError as ex:
+        raise PublishError(f"Fetch failed (network): {ex}") from ex
+    if r.status_code != 200:
+        raise PublishError(_explain_api_error(r))
+    d = r.json()
+    status = str(d.get("status") or "")
+    password = str(d.get("password") or "")
+    if status == "private":
+        visibility = "private"
+    elif password:
+        visibility = "password"
+    else:
+        visibility = "public"
+    return {
+        "status": status,
+        "status_intent": "draft" if status == "draft" else "publish",
+        "password": password,
+        "visibility": visibility,
+        "url": d.get("URL") or d.get("short_URL") or "",
+        "title": d.get("title") or "",
+    }
+
+
 def _explain_api_error(r: httpx.Response) -> str:
     try:
         data = r.json()
@@ -310,14 +343,18 @@ def _explain_api_error(r: httpx.Response) -> str:
     return f"Publish failed (HTTP {r.status_code}): {msg}"
 
 
-def _writeback(path: Path, post_id: str, url: str, status: str) -> None:
-    """Record the publish result in the note's own frontmatter (targeted edit)."""
+def _writeback(path: Path, post_id: str, url: str, status: str,
+               visibility: str = "public") -> None:
+    """Record the publish result in the note's own frontmatter (targeted edit).
+    Persists `visibility:` too so the vault tracks WP state (the password itself is
+    never written back — it's a secret)."""
     text = path.read_text(encoding="utf-8")
     fields = {
         "wp_post_id": post_id,
         "published_url": url,
         "published_at": date.today().isoformat(),
         "publish": status,
+        "visibility": visibility,
     }
     m = _FM_RE.match(text)
     if m:
@@ -369,7 +406,7 @@ def publish_note(creds: WPCreds, path, *,
     # `publish:` frontmatter records the draft/publish *intent* — keep visibility
     # (private/password) out of it (that lives in `visibility:`/`wp_password:`).
     writeback_status = "publish" if result.status in ("publish", "private") else "draft"
-    _writeback(path, new_id, post_url, writeback_status)
+    _writeback(path, new_id, post_url, writeback_status, result.visibility)
 
     result.action = action
     result.url = post_url

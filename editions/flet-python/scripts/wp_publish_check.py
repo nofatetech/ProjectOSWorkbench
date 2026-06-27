@@ -135,9 +135,11 @@ def _pure_tests() -> int:
         check("fm visibility overrides (no opts vis)", plo["status"] == "private")
 
         # writeback round-trip (simulate a successful create)
-        publish._writeback(note, "12345", "https://myweb1712.wordpress.com/?p=12345", "draft")
+        publish._writeback(note, "12345", "https://myweb1712.wordpress.com/?p=12345",
+                           "draft", "private")
         txt = note.read_text()
         check("writeback wp_post_id", "wp_post_id: 12345" in txt)
+        check("writeback visibility", "visibility: private" in txt)
         check("writeback url", "published_url: https://myweb1712.wordpress.com/?p=12345" in txt)
         check("writeback published_at", "published_at:" in txt)
         check("writeback preserved body", "A paragraph" in txt)

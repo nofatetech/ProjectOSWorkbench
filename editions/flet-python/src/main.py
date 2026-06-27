@@ -3070,6 +3070,19 @@ class WorkbenchApp:
             password=str(args.get("password") or "").strip())
         if args.get("status"):
             opts.status = str(args["status"]).strip()
+        else:
+            # Updating an existing post with no explicit status: preserve the LIVE
+            # status/visibility instead of forcing draft-first (which would
+            # downgrade a published or password-protected post).
+            post_id = self._note_wp_post_id(path)
+            if post_id:
+                try:
+                    live = publish.get_post(creds, post_id)
+                    opts.status = live["status_intent"]
+                    if not opts.visibility:
+                        opts.visibility = live["visibility"]
+                except publish.PublishError:
+                    pass
         try:
             res = publish.publish_note(creds, path, options=opts)
         except publish.PublishError as ex:
@@ -3085,10 +3098,19 @@ class WorkbenchApp:
             parts.append(f"tags={', '.join(res.tags)}")
         return " · ".join(parts)
 
+    def _note_wp_post_id(self, path: Path) -> str:
+        """The note's `wp_post_id` frontmatter ("" if unpublished)."""
+        try:
+            return str(frontmatter.load(str(path)).metadata.get("wp_post_id") or "").strip()
+        except Exception:
+            return ""
+
     def _on_publish_note(self, path: Path, project: Optional[Project] = None):
-        """Confirm (with visibility/password + a category/tag preview), then publish
-        or update on WordPress.com. Draft-first; the network call runs off the UI
-        thread in _do_publish_note."""
+        """Entry point for the Publish button. For a NEW post, open the dialog
+        immediately. For an UPDATE, first fetch the post's LIVE status/visibility
+        from WP (off the UI thread) so the dialog seeds from reality — this is what
+        stops an update from silently downgrading a live/password-protected post to
+        draft."""
         cfg = self.state.config
         try:
             publish.creds_from_config(cfg).validate()
@@ -3096,51 +3118,100 @@ class WorkbenchApp:
             self._toast(str(ex))
             return
         project = project or self._project_for_path(path)
-        published, _ = self._note_publish_state(path)
+        post_id = self._note_wp_post_id(path)
+        if not post_id:
+            self._show_publish_dialog(path, project, None)
+            return
+        self._toast("Checking WordPress…")
+        creds = publish.creds_from_config(cfg)
+
+        def run():
+            try:
+                live = publish.get_post(creds, post_id)
+            except Exception:
+                live = None  # fall back to last-known frontmatter values
+
+            async def _show():
+                self._show_publish_dialog(path, project, live)
+
+            try:
+                self.page.run_task(_show)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_publish_dialog(self, path: Path, project: Optional[Project],
+                             live: Optional[dict]):
+        """The publish/update confirm dialog: Status + Visibility dropdowns +
+        password + a category/tag preview. For updates, `live` carries the actual
+        WP state so the dropdowns start from reality (not stale frontmatter)."""
+        cfg = self.state.config
+        published = bool(live) or bool(self._note_wp_post_id(path))
         default_status = getattr(cfg, "publish_default_status", "draft")
         site = getattr(cfg, "wpcom_site", "") or "WordPress.com"
 
-        # Preview the computed categories/tags + seed visibility from frontmatter
-        # (pass no visibility override so the note's own value shows through).
+        # category/tag preview + frontmatter visibility (the no-override build).
         try:
             _pl, prev, _pid = publish.build_payload(
                 path, self._publish_options_for(project))
-            cats, tags, seed_vis = prev.categories, prev.tags, prev.visibility
+            cats, tags, fm_vis = prev.categories, prev.tags, prev.visibility
         except Exception:
-            cats, tags, seed_vis = [], [], "public"
+            cats, tags, fm_vis = [], [], "public"
 
+        if live:
+            status_seed = live.get("status_intent", "draft")
+            vis_seed = live.get("visibility", "public")
+        else:
+            status_seed, vis_seed = default_status, fm_vis
+
+        status_dd = ft.Dropdown(
+            label="Status", value=status_seed,
+            options=[ft.dropdown.Option("draft"), ft.dropdown.Option("publish")])
         vis_dd = ft.Dropdown(
-            label="Visibility", value=seed_vis or "public",
+            label="Visibility", value=vis_seed or "public",
             options=[ft.dropdown.Option("public"), ft.dropdown.Option("private"),
                      ft.dropdown.Option("password")])
-        pwd_field = ft.TextField(label="Post password (for password-protected)",
-                                 password=True, can_reveal_password=True, text_size=13)
+        pwd_field = ft.TextField(
+            label="Post password (only for password-protected; leave blank to keep current)",
+            password=True, can_reveal_password=True, text_size=13)
         verb = "Update" if published else "Publish"
         body = (f"Push the latest version of “{path.stem}” to its existing post on {site}."
                 if published else
-                f"Create a new {default_status} post for “{path.stem}” on {site}.")
+                f"Create a new post for “{path.stem}” on {site}.")
         meta_line = "  ·  ".join(filter(None, [
             f"Category: {', '.join(cats)}" if cats else "",
             f"Tags: {', '.join(tags)}" if tags else "",
         ])) or "No category/tags (set an area, or wp_categories/wp_tags in the note)."
+
+        rows: list[ft.Control] = [
+            ft.Text(body, size=13),
+            ft.Text(meta_line, size=11, italic=True, color=ft.Colors.OUTLINE),
+        ]
+        if live:
+            rows.append(ft.Text(
+                f"Live on WP: {live.get('status', '?')} · {live.get('visibility', '?')} "
+                "(dropdowns below reflect this — change to override).",
+                size=11, italic=True, color=ft.Colors.TERTIARY))
+        elif published:
+            rows.append(ft.Text(
+                "⚠ Couldn't read the live status from WP — using the note's "
+                "last-known values. Set Status/Visibility below to be sure.",
+                size=11, color=ft.Colors.ERROR))
+        rows += [status_dd, vis_dd, pwd_field]
 
         def go(_e):
             self.page.pop_dialog()
             opts = self._publish_options_for(
                 project, visibility=(vis_dd.value or "").strip(),
                 password=(pwd_field.value or "").strip())
+            opts.status = (status_dd.value or default_status).strip()
             self._do_publish_note(path, opts)
 
         dlg = ft.AlertDialog(
             title=ft.Text("Update published post" if published else "Publish to web"),
-            content=ft.Container(width=480, content=ft.Column([
-                ft.Text(body, size=13),
-                ft.Text(meta_line, size=11, italic=True, color=ft.Colors.OUTLINE),
-                vis_dd,
-                pwd_field,
-                ft.Text(f"Status: {default_status}  ·  stays editable on WP.",
-                        size=11, italic=True, color=ft.Colors.OUTLINE),
-            ], tight=True, spacing=8)),
+            content=ft.Container(width=480, content=ft.Column(
+                rows, tight=True, spacing=8)),
             actions=[
                 ft.TextButton("Cancel", on_click=lambda _e: self.page.pop_dialog()),
                 ft.FilledButton(verb, icon=ft.Icons.PUBLIC, on_click=go),
