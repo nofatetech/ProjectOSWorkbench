@@ -45,7 +45,7 @@ from vault import (_DEFAULT_VAULT_PATH, _resolve_vault_path, _load_project_from_
                    _coerce_date, _iso_week, append_to_main_note,
                    create_project_note, promote_to_folder, write_status_review,
                    load_state_from_vault, _scan_tasks,
-                   toggle_task, scan_project_content)
+                   toggle_task, set_task_state, scan_project_content)
 from views.people import PeopleView
 from osactions import (_resolve_working_dir, _scan_working_dir, _git_short_status,
                        open_in_editor, open_in_terminal, reveal_in_files, _is_git_repo, open_in_git_ui, open_in_obsidian,
@@ -413,6 +413,16 @@ def _walk_atref(base: Path, source: str, to_insert) -> list[dict]:
 # UI
 # ----------------------------------------------------------------------------
 
+# Global TasksBoard columns, left→right, keyed to vault.TASK_STATES:
+# (state key, column label, icon, accent color).
+_BOARD_SPECS = (
+    ("todo", "Todo", ft.Icons.RADIO_BUTTON_UNCHECKED, ft.Colors.PRIMARY),
+    ("doing", "Doing", ft.Icons.AUTORENEW, ft.Colors.TERTIARY),
+    ("paused", "Paused", ft.Icons.PAUSE_CIRCLE_OUTLINE, ft.Colors.AMBER_700),
+    ("done", "Done", ft.Icons.CHECK_CIRCLE_OUTLINE, ft.Colors.GREEN_600),
+)
+
+
 class WorkbenchApp:
     def __init__(self, page: ft.Page):
         self.page = page
@@ -486,9 +496,24 @@ class WorkbenchApp:
         self.settings_debug_switch: ft.Switch
         self.settings_ollama_field: ft.TextField
         self.settings_save_status: ft.Text
-        # TasksView controls
+        # TasksView controls (per-project board, opened from an overview)
         self.tasks_content: ft.Column
         self.tasks_view_body: ft.Control
+        # Global TasksBoard controls + filter state (across all projects)
+        self.tasksboard_content: ft.Column
+        self.tasksboard_view_body: ft.Control
+        self.tasksboard_search: ft.TextField
+        self._tasksboard_area: str = ""        # area name filter ("" = all)
+        self._tasksboard_query: str = ""       # text search
+        self._tasksboard_show_inactive = False  # include non-active projects
+        self._tasksboard_hide_done = False     # collapse the Done column
+        self._tasksboard_excluded: set[str] = set()  # unchecked project ids
+        self._tasksboard_projects_open = True   # project-filter panel expanded
+        # On-demand load: the board reads from disk only when "Get tasks" is
+        # pressed, scanning just the selected projects (not all 58). Results
+        # persist across tab re-opens; None = never loaded this session.
+        self._tasks_results: Optional[list[Task]] = None
+        self._tasks_stale = False  # a disk-scope filter changed since last load
         # AreaView controls
         self.area_content: ft.Column
         self.area_view_body: ft.Control
@@ -528,6 +553,7 @@ class WorkbenchApp:
         self.agent_view_body = self._build_agent_view_body()
         self.settings_view_body = self._build_settings_view_body()
         self.tasks_view_body = self._build_tasks_view_body()
+        self.tasksboard_view_body = self._build_tasksboard_view_body()
         self.area_view_body = self._build_area_view_body()
         self.inbox_view_body = self._build_inbox_view_body()
         self.resources_view_body = self._build_resources_view_body()
@@ -555,6 +581,7 @@ class WorkbenchApp:
         self.sidebar_home_row = ft.Container()
         self.sidebar_inbox_row = ft.Container()
         self.sidebar_reviews_row = ft.Container()
+        self.sidebar_tasks_row = ft.Container()
         self.sidebar_resources_row = ft.Container()
         self.sidebar_people_row = ft.Container()
         # Quick capture: type → Enter (or +) drops a note into 00_Inbox/.
@@ -622,6 +649,7 @@ class WorkbenchApp:
                             self.sidebar_inbox_row,
                             sidebar_capture_row,
                             self.sidebar_reviews_row,
+                            self.sidebar_tasks_row,
                             self.sidebar_resources_row,
                             self.sidebar_people_row,
                             ft.Container(height=8),
@@ -754,6 +782,8 @@ class WorkbenchApp:
         new_state.config = cfg
         new_state.areas_filter = old_areas_filter  # keep the sidebar filter field in sync
         self.state = new_state
+        self._tasks_results = None  # projects changed → board must reload
+        self._tasks_stale = False
         self._load_persisted_threads()
         survivors = [t for t in old_tabs if self._tab_alive(t)]
         if survivors:
@@ -841,6 +871,39 @@ class WorkbenchApp:
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             on_click=lambda e: self._open_reviews(),
+        )
+
+    def _build_tasks_sidebar_row(self) -> ft.Container:
+        # Badge = open tasks in the last on-demand load ("–" until first loaded).
+        # No scan happens here — the board reads from disk only on "Get tasks".
+        count = self._tasksboard_badge_count()  # None until first loaded
+        has = bool(count)
+        is_active = bool(self.state.active_tab
+                         and self.state.active_tab.kind == "tasks-global")
+        return ft.Container(
+            padding=ft.Padding(left=8, top=8, right=8, bottom=8),
+            border_radius=6,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH if is_active else None,
+            content=ft.Row(
+                controls=[
+                    ft.Icon(icon=ft.Icons.CHECKLIST_ROUNDED, size=23,
+                            color=ft.Colors.INDIGO_400),
+                    ft.Text("Tasks", size=14, weight=ft.FontWeight.BOLD, expand=True),
+                    ft.Container(
+                        padding=ft.Padding(left=6, top=1, right=6, bottom=1),
+                        border_radius=10,
+                        bgcolor=(ft.Colors.PRIMARY_CONTAINER if has
+                                 else ft.Colors.SURFACE_CONTAINER_HIGHEST),
+                        content=ft.Text("–" if count is None else str(count), size=10,
+                                        weight=ft.FontWeight.BOLD,
+                                        color=(ft.Colors.ON_PRIMARY_CONTAINER if has
+                                               else ft.Colors.OUTLINE)),
+                    ),
+                ],
+                spacing=8,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            on_click=lambda e: self._open_tasks_global(),
         )
 
     def _build_browser_sidebar_row(
@@ -1612,6 +1675,7 @@ class WorkbenchApp:
             (self.sidebar_home_row, self._build_home_sidebar_row),
             (self.sidebar_inbox_row, self._build_inbox_sidebar_row),
             (self.sidebar_reviews_row, self._build_reviews_sidebar_row),
+            (self.sidebar_tasks_row, self._build_tasks_sidebar_row),
             (self.sidebar_resources_row, self._build_resources_sidebar_row),
             (self.sidebar_people_row, self.people_view.build_sidebar_row),
         ):
@@ -1843,6 +1907,8 @@ class WorkbenchApp:
         if tab.kind == "tasks":
             p = self.state.get_project(tab.ref_id)
             return (f"Tasks · {p.name}" if p else None), ft.Icons.CHECKLIST
+        if tab.kind == "tasks-global":
+            return "Tasks", ft.Icons.CHECKLIST_ROUNDED
         if tab.kind == "area":
             a = self.state.get_area(tab.ref_id)
             return (a.name if a else None), ft.Icons.WORKSPACES_OUTLINED
@@ -1885,6 +1951,9 @@ class WorkbenchApp:
         elif tab.kind == "tasks":
             self.view_slot.content = self.tasks_view_body
             self._refresh_tasks_view()
+        elif tab.kind == "tasks-global":
+            self.view_slot.content = self.tasksboard_view_body
+            self._refresh_tasksboard_view()
         elif tab.kind == "area":
             self.view_slot.content = self.area_view_body
             self._refresh_area_view()
@@ -5341,6 +5410,455 @@ class WorkbenchApp:
             self._refresh_overview_view()
             self.page.update()
 
+    # --- Global TasksBoard: "what's next to do, anywhere" -------------------
+    # Left→right columns map to TASK_STATES (see _BOARD_SPECS). Each card carries
+    # a "move to ▾" menu (click, no drag) that rewrites the checkbox char in its
+    # source .md.
+    def _build_tasksboard_view_body(self) -> ft.Control:
+        self.tasksboard_content = ft.Column(spacing=16, scroll=ft.ScrollMode.AUTO,
+                                            expand=True)
+        return ft.Container(
+            expand=True, padding=ft.Padding(left=24, top=20, right=24, bottom=20),
+            content=self.tasksboard_content,
+        )
+
+    def _is_task_project_eligible(self, p: Project) -> bool:
+        """Running experiments only — mirrors the Reviews board's eligibility."""
+        return p.status in ("active", "persist", "pivot")
+
+    def _tasksboard_badge_count(self) -> Optional[int]:
+        """Open tasks (not done) in the last on-demand load. None = not loaded
+        yet this session (no scan is triggered just to paint the badge)."""
+        if self._tasks_results is None:
+            return None
+        return sum(1 for t in self._tasks_results if t.state != "done")
+
+    def _on_tasksboard_load(self, e=None):
+        """Read from disk — but only the selected (in-scope, not-excluded)
+        projects, so a focused board doesn't pay for all 58."""
+        projs = [p for p in self._tasksboard_scope_projects()
+                 if p.id not in self._tasksboard_excluded]
+        tasks: list[Task] = []
+        for p in projs:
+            tasks.extend(_scan_tasks(p, VAULT_PATH))
+        self._tasks_results = tasks
+        self._tasks_stale = False
+        self._refresh_tasksboard_view()
+        self._refresh_sidebar()  # badge now reflects the load
+        self.page.update()
+
+    def _tasksboard_scope_projects(self) -> list[Project]:
+        """Projects in scope after the scope toggle + area filter, BEFORE the
+        per-project checkbox exclusion. Drives both the project panel and the
+        task filter so the two never disagree."""
+        projs = self.state.projects
+        if not self._tasksboard_show_inactive:
+            projs = [p for p in projs if self._is_task_project_eligible(p)]
+        if self._tasksboard_area:
+            projs = [p for p in projs if p.area == self._tasksboard_area]
+        return projs
+
+    def _tasksboard_filtered(self) -> list[Task]:
+        """Text-filter the loaded results. Project/area/scope selection already
+        bounded what was scanned, so only the live text search applies here."""
+        if self._tasks_results is None:
+            return []
+        q = self._tasksboard_query.strip().lower()
+        if not q:
+            return list(self._tasks_results)
+        return [t for t in self._tasks_results
+                if q in t.text.lower() or q in t.project_name.lower()]
+
+    def _refresh_tasksboard_view(self):
+        self.tasksboard_content.controls.clear()
+        loaded = self._tasks_results is not None
+        tasks = self._tasksboard_filtered()
+        by_state: dict[str, list[Task]] = {k: [] for k, *_ in _BOARD_SPECS}
+        for t in tasks:
+            # State is always canonical (the scanner maps unknown chars → todo).
+            by_state.get(t.state, by_state["todo"]).append(t)
+        open_n = sum(len(by_state[k]) for k in ("todo", "doing", "paused"))
+        summary = (f"{open_n} open · {len(by_state['done'])} done" if loaded
+                   else "not loaded")
+
+        # Header
+        self.tasksboard_content.controls.append(
+            ft.Row(
+                controls=[
+                    ft.Icon(ft.Icons.CHECKLIST_ROUNDED, size=28,
+                            color=PLATINUM["text2"]),
+                    ft.Text("Tasks", size=28, font_family="Newsreader",
+                            weight=ft.FontWeight.BOLD),
+                    ft.Container(expand=True),
+                    ft.Text(summary, size=12, color=ft.Colors.OUTLINE),
+                ],
+                spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            )
+        )
+        self.tasksboard_content.controls.append(self._build_tasksboard_filters_card())
+
+        if not loaded:
+            self.tasksboard_content.controls.append(self._tasksboard_prompt())
+            return
+        if not tasks:
+            self.tasksboard_content.controls.append(self._tasksboard_empty())
+            return
+
+        cols = []
+        for key, label, icon, accent in _BOARD_SPECS:
+            if key == "done" and self._tasksboard_hide_done:
+                continue
+            cols.append(self._build_board_column(key, label, icon, accent,
+                                                 by_state[key]))
+        self.tasksboard_content.controls.append(
+            ft.Row(controls=cols, spacing=14,
+                   vertical_alignment=ft.CrossAxisAlignment.START,
+                   scroll=ft.ScrollMode.AUTO)
+        )
+
+    def _tasksboard_prompt(self) -> ft.Control:
+        """Shown before the first load — the board reads on demand."""
+        return ft.Container(
+            padding=ft.Padding(left=24, top=40, right=24, bottom=40),
+            alignment=ft.Alignment.CENTER,
+            content=ft.Column(
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=10,
+                tight=True,
+                controls=[
+                    ft.Icon(ft.Icons.PLAYLIST_ADD_CHECK, size=46,
+                            color=ft.Colors.TERTIARY),
+                    ft.Text("Pick your filters, then load", size=20,
+                            font_family="Newsreader", weight=ft.FontWeight.BOLD),
+                    ft.Text("The board reads tasks from disk on demand — choose "
+                            "the projects above and press Get tasks.",
+                            size=12, color=ft.Colors.OUTLINE,
+                            text_align=ft.TextAlign.CENTER),
+                    ft.FilledButton("Get tasks", icon=ft.Icons.DOWNLOAD_ROUNDED,
+                                    on_click=self._on_tasksboard_load),
+                ],
+            ),
+        )
+
+    def _tasksboard_empty(self) -> ft.Control:
+        scope = ("any project" if self._tasksboard_show_inactive
+                 else "your active projects")
+        msg = ("No tasks match the current filters."
+               if (self._tasksboard_query or self._tasksboard_area)
+               else f"No `- [ ]` checkboxes found across {scope}.")
+        return ft.Container(
+            padding=ft.Padding(left=24, top=40, right=24, bottom=40),
+            alignment=ft.Alignment.CENTER,
+            content=ft.Column(
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=8,
+                tight=True,
+                controls=[
+                    ft.Icon(ft.Icons.TASK_ALT, size=44, color=ft.Colors.TERTIARY),
+                    ft.Text("Nothing on the board", size=20,
+                            font_family="Newsreader", weight=ft.FontWeight.BOLD),
+                    ft.Text(msg, size=12, color=ft.Colors.OUTLINE),
+                    ft.Text("Tasks are `- [ ]` checkboxes in your project notes.",
+                            size=11, italic=True, color=ft.Colors.OUTLINE),
+                ],
+            ),
+        )
+
+    def _build_tasksboard_filters_card(self) -> ft.Control:
+        """One card holding every filter: area/search/switches + the per-project
+        include/exclude grid + the on-demand Get-tasks button. Everything that
+        narrows the board lives here."""
+        areas = sorted({a.name for a in self.state.areas})
+        area_dd = ft.Dropdown(
+            label="Area", value=self._tasksboard_area or "(all)",
+            text_size=12, dense=True, width=190,
+            options=[ft.dropdown.Option("(all)")]
+                    + [ft.dropdown.Option(a) for a in areas],
+            on_select=self._on_tasksboard_area_change,
+        )
+        self.tasksboard_search = ft.TextField(
+            hint_text="search tasks…", value=self._tasksboard_query,
+            text_size=12, dense=True, width=240,
+            prefix_icon=ft.Icons.SEARCH,
+            on_change=self._on_tasksboard_search,
+        )
+        inactive_sw = ft.Switch(
+            label="Show inactive projects", value=self._tasksboard_show_inactive,
+            scale=0.85, on_change=self._on_tasksboard_toggle_inactive,
+        )
+        done_sw = ft.Switch(
+            label="Hide done", value=self._tasksboard_hide_done,
+            scale=0.85, on_change=self._on_tasksboard_toggle_done,
+        )
+
+        # Card header: title + a reload hint + the on-demand load button. When a
+        # scope filter changed (stale) or nothing's loaded yet, the button turns
+        # into a loud attention-colored "Reload" so it's obvious the board on
+        # screen doesn't yet reflect the filters.
+        if self._tasks_stale:
+            load_btn = ft.FilledButton(
+                "Reload tasks", icon=ft.Icons.REFRESH_ROUNDED,
+                tooltip="Filters changed — re-read the selected projects from disk",
+                style=ft.ButtonStyle(bgcolor=ft.Colors.TERTIARY,
+                                     color=ft.Colors.ON_TERTIARY),
+                on_click=self._on_tasksboard_load,
+            )
+        else:
+            load_btn = ft.FilledButton(
+                "Get tasks", icon=ft.Icons.DOWNLOAD_ROUNDED,
+                tooltip="Read tasks from disk for the selected projects",
+                on_click=self._on_tasksboard_load,
+            )
+        head_controls: list[ft.Control] = [
+            ft.Text("FILTERS", size=11, weight=ft.FontWeight.BOLD,
+                    color=ft.Colors.OUTLINE),
+            ft.Container(expand=True),
+        ]
+        if self._tasks_stale:
+            head_controls.append(
+                ft.Text("filters changed — board shows the last load", size=11,
+                        italic=True, color=ft.Colors.TERTIARY))
+        elif self._tasks_results is None:
+            head_controls.append(
+                ft.Text("not loaded yet", size=11, italic=True,
+                        color=ft.Colors.OUTLINE))
+        head_controls.append(load_btn)
+
+        children: list[ft.Control] = [
+            ft.Row(head_controls, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            # Wrapping Row = a Flutter Wrap (no `expand` spacer allowed); controls
+            # just flow to a second run on narrow windows.
+            ft.Row(controls=[area_dd, self.tasksboard_search, inactive_sw, done_sw],
+                   spacing=12, run_spacing=8, wrap=True,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Divider(height=1),
+            self._build_tasksboard_projects_section(),
+        ]
+        return ft.Container(
+            padding=14, border_radius=8, border=_all_border(),
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW,
+            content=ft.Column(children, spacing=10, tight=True),
+        )
+
+    def _build_tasksboard_projects_section(self) -> ft.Control:
+        """The PROJECTS sub-block of the filters card: area-grouped include/
+        exclude checkboxes, height-capped so a long list never dominates."""
+        scope = self._tasksboard_scope_projects()
+        total = len(scope)
+        included = sum(1 for p in scope if p.id not in self._tasksboard_excluded)
+        chevron = (ft.Icons.EXPAND_LESS if self._tasksboard_projects_open
+                   else ft.Icons.EXPAND_MORE)
+        header = ft.Row(
+            controls=[
+                ft.Text("PROJECTS", size=11, weight=ft.FontWeight.BOLD,
+                        color=ft.Colors.OUTLINE),
+                ft.Container(
+                    padding=ft.Padding(left=6, top=1, right=6, bottom=1),
+                    border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                    content=ft.Text(f"{included}/{total}", size=10,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=ft.Colors.OUTLINE),
+                ),
+                ft.TextButton("All", on_click=self._on_tasksboard_projects_all),
+                ft.TextButton("None", on_click=self._on_tasksboard_projects_none),
+                ft.Container(expand=True),
+                ft.IconButton(chevron, icon_size=18,
+                              tooltip=("Collapse" if self._tasksboard_projects_open
+                                       else "Expand"),
+                              on_click=self._on_tasksboard_projects_collapse),
+            ],
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+        children: list[ft.Control] = [header]
+
+        if not scope:
+            children.append(ft.Text("No projects in scope — try Show inactive.",
+                                    size=11, italic=True, color=ft.Colors.OUTLINE))
+        elif self._tasksboard_projects_open:
+            groups: dict[str, list[Project]] = {}
+            for p in scope:
+                groups.setdefault(p.area or "(uncategorized)", []).append(p)
+            area_cols: list[ft.Control] = []
+            for area in sorted(groups, key=str.lower):
+                col_items: list[ft.Control] = [
+                    ft.Text(area.upper(), size=9, weight=ft.FontWeight.BOLD,
+                            color=ft.Colors.OUTLINE),
+                ]
+                for p in sorted(groups[area], key=lambda p: p.name.lower()):
+                    col_items.append(ft.Checkbox(
+                        label=p.name,
+                        value=(p.id not in self._tasksboard_excluded),
+                        label_style=ft.TextStyle(size=11),
+                        scale=0.9,
+                        on_change=lambda e, pid=p.id:
+                            self._on_tasksboard_project_toggle(pid, e.control.value),
+                    ))
+                area_cols.append(ft.Container(
+                    width=210,
+                    content=ft.Column(col_items, spacing=0, tight=True),
+                ))
+            # All area-columns side by side, scrolling horizontally (no wrap, no
+            # height cap) so each column shows its full project list.
+            children.append(ft.Row(
+                area_cols, spacing=16,
+                vertical_alignment=ft.CrossAxisAlignment.START,
+                scroll=ft.ScrollMode.AUTO,
+            ))
+
+        return ft.Column(children, spacing=8, tight=True)
+
+    def _mark_tasks_stale(self):
+        """A filter that changes *what gets scanned* (vs. a display filter) →
+        the loaded results no longer match the selection until reloaded."""
+        if self._tasks_results is not None:
+            self._tasks_stale = True
+
+    def _on_tasksboard_project_toggle(self, pid: str, value: bool):
+        if value:
+            self._tasksboard_excluded.discard(pid)
+        else:
+            self._tasksboard_excluded.add(pid)
+        self._mark_tasks_stale()
+        self._refresh_tasksboard_view()
+        self.page.update()
+
+    def _on_tasksboard_projects_all(self, e):
+        self._tasksboard_excluded.clear()
+        self._mark_tasks_stale()
+        self._refresh_tasksboard_view()
+        self.page.update()
+
+    def _on_tasksboard_projects_none(self, e):
+        self._tasksboard_excluded |= {p.id for p in self._tasksboard_scope_projects()}
+        self._mark_tasks_stale()
+        self._refresh_tasksboard_view()
+        self.page.update()
+
+    def _on_tasksboard_projects_collapse(self, e):
+        self._tasksboard_projects_open = not self._tasksboard_projects_open
+        self._refresh_tasksboard_view()
+        self.page.update()
+
+    def _build_board_column(self, key: str, label: str, icon, accent: object,
+                            tasks: list[Task]) -> ft.Control:
+        items: list[ft.Control] = [
+            ft.Row(
+                controls=[
+                    ft.Icon(icon, size=15, color=accent),
+                    ft.Text(label, size=11, weight=ft.FontWeight.BOLD, color=accent),
+                    ft.Container(
+                        padding=ft.Padding(left=6, top=1, right=6, bottom=1),
+                        border_radius=8, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGH,
+                        content=ft.Text(str(len(tasks)), size=10,
+                                        weight=ft.FontWeight.BOLD, color=accent),
+                    ),
+                ],
+                spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        ]
+        if not tasks:
+            items.append(ft.Text("(none)", size=11, italic=True,
+                                 color=ft.Colors.OUTLINE))
+        for t in tasks:
+            items.append(self._render_board_task(t))
+        return ft.Container(
+            width=300, padding=12, border_radius=8,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW, border=_all_border(),
+            content=ft.Column(controls=items, spacing=8),
+        )
+
+    def _render_board_task(self, t: Task) -> ft.Control:
+        p = self.state.get_project(t.project_id)
+        proj_color = STATUS_COLORS.get(p.status, ft.Colors.OUTLINE) if p \
+            else ft.Colors.OUTLINE
+        src_label = Path(t.source_path).name
+        # Project chip — dot colored by the project's status.
+        chip = ft.Row(
+            controls=[
+                ft.Container(width=7, height=7, border_radius=4, bgcolor=proj_color),
+                ft.Text(t.project_name or "—", size=10, color=ft.Colors.OUTLINE),
+            ],
+            spacing=5, vertical_alignment=ft.CrossAxisAlignment.CENTER, tight=True,
+        )
+        done = t.state == "done"
+        return ft.Container(
+            padding=ft.Padding(left=10, top=8, right=6, bottom=8),
+            border_radius=6, bgcolor=ft.Colors.SURFACE_CONTAINER,
+            content=ft.Column(
+                spacing=5,
+                controls=[
+                    ft.Row(
+                        controls=[
+                            ft.Text(t.text, size=13, expand=True,
+                                    color=(ft.Colors.OUTLINE if done
+                                           else ft.Colors.ON_SURFACE)),
+                            self._build_task_move_menu(t),
+                        ],
+                        spacing=4,
+                        vertical_alignment=ft.CrossAxisAlignment.START,
+                    ),
+                    ft.Row(
+                        controls=[
+                            chip,
+                            ft.Container(expand=True),
+                            ft.Text(f"{src_label}:{t.line_number}", size=9,
+                                    italic=True, color=ft.Colors.OUTLINE),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                ],
+            ),
+        )
+
+    def _build_task_move_menu(self, t: Task) -> ft.Control:
+        items = []
+        for key, label, icon, _accent in _BOARD_SPECS:
+            items.append(ft.PopupMenuItem(
+                icon=icon,
+                content=ft.Text(("● " if key == t.state else "")
+                                + f"Move to {label}", size=12),
+                on_click=lambda e, task=t, ns=key: self._on_tasksboard_move(task, ns),
+            ))
+        return ft.PopupMenuButton(
+            icon=ft.Icons.MORE_VERT, icon_size=16, tooltip="Move task",
+            items=items,
+        )
+
+    def _on_tasksboard_move(self, task: Task, new_state: str):
+        if task.state == new_state:
+            return
+        if set_task_state(task, new_state):
+            # set_task_state mutates the loaded task in place and the line number
+            # is unchanged (char swap), so results stay valid — no re-scan.
+            self._refresh_tasksboard_view()
+            self._refresh_sidebar()  # badge reflects the new open count
+            self.page.update()
+        else:
+            self._toast("couldn't update task — file may have changed")
+
+    # Display filters — apply live to the already-loaded results (no disk read).
+    def _on_tasksboard_search(self, e):
+        self._tasksboard_query = e.control.value or ""
+        self._refresh_tasksboard_view()
+        self.page.update()
+
+    def _on_tasksboard_toggle_done(self, e):
+        self._tasksboard_hide_done = bool(e.control.value)
+        self._refresh_tasksboard_view()
+        self.page.update()
+
+    # Scope filters — change what *would* be scanned → mark stale (needs reload).
+    def _on_tasksboard_area_change(self, e):
+        val = e.control.value or ""
+        self._tasksboard_area = "" if val == "(all)" else val
+        self._mark_tasks_stale()
+        self._refresh_tasksboard_view()
+        self.page.update()
+
+    def _on_tasksboard_toggle_inactive(self, e):
+        self._tasksboard_show_inactive = bool(e.control.value)
+        self._mark_tasks_stale()
+        self._refresh_tasksboard_view()
+        self.page.update()
+
     # --- SettingsView refresh ---
     def _refresh_settings_view(self):
         cfg = self.state.config  # used by help-text f-strings below
@@ -5650,6 +6168,11 @@ class WorkbenchApp:
 
     def _open_reviews(self):
         self._open_or_focus(OpenTab(kind="reviews", ref_id="reviews"))
+
+    def _open_tasks_global(self):
+        # No auto-scan — the board loads on demand via "Get tasks". Prior
+        # results (if any this session) stay until the user reloads.
+        self._open_or_focus(OpenTab(kind="tasks-global", ref_id="tasks"))
 
     def _open_resources(self):
         self._open_or_focus(OpenTab(kind="resources", ref_id="resources"))

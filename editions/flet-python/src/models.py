@@ -102,9 +102,18 @@ class Project:
 @dataclass
 class Task:
     text: str
-    checked: bool
+    state: str  # "todo" | "doing" | "paused" | "done" (see vault.TASK_STATES)
     source_path: str  # absolute path to the .md file the checkbox lives in
     line_number: int  # 1-indexed
+    # Populated by the global scan so a task can name its home project on the
+    # board; left blank for per-project scans (the project is already implied).
+    project_id: str = ""
+    project_name: str = ""
+
+    @property
+    def checked(self) -> bool:
+        """Back-compat for the open/done callers that predate multi-state."""
+        return self.state == "done"
 
 
 @dataclass

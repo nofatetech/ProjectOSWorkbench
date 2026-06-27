@@ -503,7 +503,21 @@ def load_state_from_vault(vault_path: Path) -> AppState:
     return state
 
 
-_CHECKBOX_RE = re.compile(r"^(\s*)-\s+\[([ xX])\]\s+(.*)$")
+# Multi-state checkboxes. Group 2 is any single char inside the brackets so the
+# parser sees `[/]` / `[-]` (Obsidian-Tasks convention) too, not just space/x.
+_CHECKBOX_RE = re.compile(r"^(\s*)-\s+\[([^\]])\]\s+(.*)$")
+
+# Canonical task states ↔ the checkbox char written to markdown. Order is the
+# board's left→right column order. Unknown chars (e.g. `[>]`) read as "todo" so
+# nothing is dropped; writeback only ever emits the chars below.
+TASK_STATES = ("todo", "doing", "paused", "done")
+TASK_CHAR_BY_STATE = {"todo": " ", "doing": "/", "paused": "-", "done": "x"}
+_STATE_BY_CHAR = {" ": "todo", "/": "doing", "-": "paused", "x": "done", "X": "done"}
+
+
+def task_state_for_char(ch: str) -> str:
+    """Map a raw checkbox char to a canonical state; unknown → 'todo'."""
+    return _STATE_BY_CHAR.get(ch, "todo")
 
 
 def _project_base_path(project: Project, vault_root: Path) -> Path:
@@ -513,7 +527,8 @@ def _project_base_path(project: Project, vault_root: Path) -> Path:
 
 
 def _scan_tasks(project: Project, vault_root: Path) -> list[Task]:
-    """Parse `- [ ]` / `- [x]` checkboxes from every .md file in the project."""
+    """Parse `- [ ]` / `- [/]` / `- [-]` / `- [x]` checkboxes from every .md
+    file in the project, tagged with the project's id/name for the board."""
     base = _project_base_path(project, vault_root)
     md_files: list[Path] = []
     if base.is_file():
@@ -536,16 +551,26 @@ def _scan_tasks(project: Project, vault_root: Path) -> list[Task]:
                 continue
             tasks.append(Task(
                 text=m.group(3).strip(),
-                checked=m.group(2).lower() == "x",
+                state=task_state_for_char(m.group(2)),
                 source_path=str(f),
                 line_number=i,
+                project_id=project.id,
+                project_name=project.name,
             ))
     return tasks
 
 
-def toggle_task(task: Task) -> bool:
-    """Read source file, flip the checkbox at task.line_number, write back.
-    Returns True on success, False on any failure."""
+def scan_all_tasks(projects: list[Project], vault_root: Path) -> list[Task]:
+    """Global sweep: every project's checkboxes in one flat list."""
+    tasks: list[Task] = []
+    for p in projects:
+        tasks.extend(_scan_tasks(p, vault_root))
+    return tasks
+
+
+def _rewrite_task_char(task: Task, new_char: str) -> bool:
+    """Read source file, replace the checkbox char at task.line_number, write
+    back. Returns True on success, False on any failure."""
     p = Path(task.source_path)
     try:
         content = p.read_text(encoding="utf-8")
@@ -557,14 +582,31 @@ def toggle_task(task: Task) -> bool:
     m = _CHECKBOX_RE.match(lines[task.line_number - 1])
     if not m:
         return False
-    indent, mark, rest = m.group(1), m.group(2), m.group(3)
-    new_mark = " " if mark.lower() == "x" else "x"
-    lines[task.line_number - 1] = f"{indent}- [{new_mark}] {rest}"
+    indent, rest = m.group(1), m.group(3)
+    lines[task.line_number - 1] = f"{indent}- [{new_char}] {rest}"
     try:
         p.write_text("\n".join(lines), encoding="utf-8")
         return True
     except Exception:
         return False
+
+
+def set_task_state(task: Task, new_state: str) -> bool:
+    """Write `new_state` (a TASK_STATES key) back to the source checkbox and
+    update the in-memory task. No-op-safe; returns False on bad state / IO."""
+    new_char = TASK_CHAR_BY_STATE.get(new_state)
+    if new_char is None:
+        return False
+    if _rewrite_task_char(task, new_char):
+        task.state = new_state
+        return True
+    return False
+
+
+def toggle_task(task: Task) -> bool:
+    """Flip a task between done and todo (legacy open/done callers). Multi-state
+    moves go through set_task_state."""
+    return set_task_state(task, "todo" if task.state == "done" else "done")
 
 
 def _first_body_line(post) -> str:
