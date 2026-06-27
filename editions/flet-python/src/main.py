@@ -1290,6 +1290,40 @@ class WorkbenchApp:
             label="CLI session command ('Open CLI session' button)",
             value=cfg.cli_session_command,
         )
+        # --- Publishing (WordPress.com) ---
+        self.settings_wp_site_field = ft.TextField(
+            label="WordPress.com site", value=getattr(cfg, "wpcom_site", ""),
+            hint_text="myweb1712.wordpress.com")
+        self.settings_wp_clientid_field = ft.TextField(
+            label="Client ID", value=getattr(cfg, "wpcom_client_id", ""))
+        self.settings_wp_secret_field = ft.TextField(
+            label="Client Secret", value=getattr(cfg, "wpcom_client_secret", ""),
+            password=True, can_reveal_password=True)
+        self.settings_wp_user_field = ft.TextField(
+            label="WordPress.com username", value=getattr(cfg, "wpcom_username", ""))
+        self.settings_wp_pass_field = ft.TextField(
+            label="Password / Application Password",
+            value=getattr(cfg, "wpcom_password", ""),
+            password=True, can_reveal_password=True)
+        self.settings_wp_status_dd = ft.Dropdown(
+            label="Default status",
+            value=getattr(cfg, "publish_default_status", "draft") or "draft",
+            options=[ft.dropdown.Option("draft"), ft.dropdown.Option("publish")])
+        self.settings_wp_category_dd = ft.Dropdown(
+            label="Auto category from",
+            value=getattr(cfg, "publish_auto_category", "area") or "area",
+            options=[ft.dropdown.Option("area"), ft.dropdown.Option("project"),
+                     ft.dropdown.Option("none")])
+        self.settings_wp_projtag_switch = ft.Switch(
+            label="Add the project name as a tag",
+            value=bool(getattr(cfg, "publish_add_project_tag", True)))
+        self.settings_wp_notetags_switch = ft.Switch(
+            label="Include the note's own tags",
+            value=bool(getattr(cfg, "publish_include_note_tags", True)))
+        self.settings_wp_tagexclude_field = ft.TextField(
+            label="Never-public tags (comma list)",
+            value=getattr(cfg, "publish_tag_exclude", ""))
+        self.settings_wp_test_status = ft.Text("", size=11, selectable=True)
         self.settings_temp_field = ft.TextField(
             label="Default temperature (0.0–2.0)",
             value=f"{cfg.temperature:.1f}",
@@ -2956,39 +2990,103 @@ class WorkbenchApp:
         except Exception:
             return False, ""
 
-    def _on_publish_note(self, path: Path):
-        """Confirm, then publish (or update) a note on WordPress.com. Draft-first;
-        the actual network call runs off the UI thread in _do_publish_note."""
-        cfg = self.state.config
-        creds = publish.creds_from_config(cfg)
+    def _project_for_path(self, path: Path) -> Optional[Project]:
+        """Find the project whose vault folder contains this note (longest match).
+        Used to derive the publish category/tags when the caller didn't pass one."""
         try:
-            creds.validate()
+            sp = path.resolve()
+        except Exception:
+            sp = path
+        best, best_len = None, -1
+        for p in self.state.projects:
+            if not p.vault_folder.endswith("/"):
+                continue  # file-scoped projects can't hold posts
+            folder = (VAULT_PATH / p.vault_folder).resolve()
+            try:
+                sp.relative_to(folder)
+            except ValueError:
+                continue
+            if len(str(folder)) > best_len:
+                best, best_len = p, len(str(folder))
+        return best
+
+    def _publish_options_for(self, project: Optional[Project], *,
+                             visibility: str = "", password: str = ""
+                             ) -> "publish.PublishOptions":
+        """Build PublishOptions from config + the note's project/area context."""
+        cfg = self.state.config
+        cat_src = getattr(cfg, "publish_auto_category", "area")
+        category = ""
+        if project:
+            if cat_src == "area":
+                category = project.area or ""
+            elif cat_src == "project":
+                category = project.name
+        extra = [project.name] if (project and getattr(
+            cfg, "publish_add_project_tag", True)) else []
+        excl = [t.strip() for t in (getattr(cfg, "publish_tag_exclude", "") or "").split(",")
+                if t.strip()]
+        return publish.PublishOptions(
+            default_status=getattr(cfg, "publish_default_status", "draft"),
+            category=category, extra_tags=extra,
+            include_note_tags=bool(getattr(cfg, "publish_include_note_tags", True)),
+            tag_exclude=excl, visibility=visibility, password=password,
+        )
+
+    def _on_publish_note(self, path: Path, project: Optional[Project] = None):
+        """Confirm (with visibility/password + a category/tag preview), then publish
+        or update on WordPress.com. Draft-first; the network call runs off the UI
+        thread in _do_publish_note."""
+        cfg = self.state.config
+        try:
+            publish.creds_from_config(cfg).validate()
         except publish.PublishError as ex:
             self._toast(str(ex))
             return
+        project = project or self._project_for_path(path)
         published, _ = self._note_publish_state(path)
         default_status = getattr(cfg, "publish_default_status", "draft")
         site = getattr(cfg, "wpcom_site", "") or "WordPress.com"
-        if published:
-            title, verb, body = ("Update published post",
-                                 "Update",
-                                 f"Push the latest version of “{path.stem}” to its "
-                                 f"existing post on {site}.")
-        else:
-            title, verb, body = ("Publish to web",
-                                 "Publish",
-                                 f"Create a new {default_status} post for “{path.stem}” "
-                                 f"on {site}.")
+
+        # Preview the computed categories/tags + seed visibility from frontmatter
+        # (pass no visibility override so the note's own value shows through).
+        try:
+            _pl, prev, _pid = publish.build_payload(
+                path, self._publish_options_for(project))
+            cats, tags, seed_vis = prev.categories, prev.tags, prev.visibility
+        except Exception:
+            cats, tags, seed_vis = [], [], "public"
+
+        vis_dd = ft.Dropdown(
+            label="Visibility", value=seed_vis or "public",
+            options=[ft.dropdown.Option("public"), ft.dropdown.Option("private"),
+                     ft.dropdown.Option("password")])
+        pwd_field = ft.TextField(label="Post password (for password-protected)",
+                                 password=True, can_reveal_password=True, text_size=13)
+        verb = "Update" if published else "Publish"
+        body = (f"Push the latest version of “{path.stem}” to its existing post on {site}."
+                if published else
+                f"Create a new {default_status} post for “{path.stem}” on {site}.")
+        meta_line = "  ·  ".join(filter(None, [
+            f"Category: {', '.join(cats)}" if cats else "",
+            f"Tags: {', '.join(tags)}" if tags else "",
+        ])) or "No category/tags (set an area, or wp_categories/wp_tags in the note)."
 
         def go(_e):
             self.page.pop_dialog()
-            self._do_publish_note(path, default_status)
+            opts = self._publish_options_for(
+                project, visibility=(vis_dd.value or "").strip(),
+                password=(pwd_field.value or "").strip())
+            self._do_publish_note(path, opts)
 
         dlg = ft.AlertDialog(
-            title=ft.Text(title),
-            content=ft.Container(width=460, content=ft.Column([
+            title=ft.Text("Update published post" if published else "Publish to web"),
+            content=ft.Container(width=480, content=ft.Column([
                 ft.Text(body, size=13),
-                ft.Text(f"Status: {default_status}  ·  it stays editable on WP.",
+                ft.Text(meta_line, size=11, italic=True, color=ft.Colors.OUTLINE),
+                vis_dd,
+                pwd_field,
+                ft.Text(f"Status: {default_status}  ·  stays editable on WP.",
                         size=11, italic=True, color=ft.Colors.OUTLINE),
             ], tight=True, spacing=8)),
             actions=[
@@ -2998,7 +3096,7 @@ class WorkbenchApp:
         )
         self.page.show_dialog(dlg)
 
-    def _do_publish_note(self, path: Path, default_status: str):
+    def _do_publish_note(self, path: Path, options: "publish.PublishOptions"):
         """Run the (network) publish off the UI thread; marshal the result toast +
         a refresh back onto the event loop (Flet 0.85 can't touch UI from a worker
         thread — mirrors the dispatch / tool-confirm marshaling)."""
@@ -3007,8 +3105,12 @@ class WorkbenchApp:
 
         def run():
             try:
-                res = publish.publish_note(creds, path, default_status=default_status)
-                msg = f"{res.action} ({res.status}): {res.title}"
+                res = publish.publish_note(creds, path, options=options)
+                extra = "".join([
+                    f" · cat: {', '.join(res.categories)}" if res.categories else "",
+                    f" · tags: {', '.join(res.tags)}" if res.tags else "",
+                ])
+                msg = f"{res.action} ({res.status}): {res.title}{extra}"
                 url = res.url
             except publish.PublishError as ex:
                 msg, url = f"Publish failed: {ex}", ""
@@ -3157,7 +3259,8 @@ class WorkbenchApp:
                     icon_color=ft.Colors.PRIMARY if pub else ft.Colors.OUTLINE,
                     tooltip=("Update published post on WordPress"
                              if pub else "Publish to web (draft) on WordPress"),
-                    on_click=lambda e, pth=Path(n.path): self._on_publish_note(pth),
+                    on_click=lambda e, pth=Path(n.path), pr=project:
+                        self._on_publish_note(pth, pr),
                 ))
             items.append(
                 ft.Container(
@@ -5232,6 +5335,35 @@ class WorkbenchApp:
                                 "template above.",
                                 size=11, color=ft.Colors.OUTLINE),
                         ft.Container(height=8),
+                        ft.Text("PUBLISHING (WordPress.com)", size=10,
+                                weight=ft.FontWeight.BOLD, color=ft.Colors.OUTLINE),
+                        ft.Text("Publish a note as a WordPress.com post (draft-first). "
+                                "Auth uses a registered app's OAuth2 password grant — "
+                                "register one at developer.wordpress.com/apps (Type = "
+                                "Web); with 2FA, use an Application Password.",
+                                size=11, color=ft.Colors.OUTLINE),
+                        self.settings_wp_site_field,
+                        self.settings_wp_clientid_field,
+                        self.settings_wp_secret_field,
+                        self.settings_wp_user_field,
+                        self.settings_wp_pass_field,
+                        ft.Row([
+                            ft.OutlinedButton("Test connection",
+                                              icon=ft.Icons.WIFI_TETHERING,
+                                              on_click=self._on_test_wp_connection),
+                            self.settings_wp_test_status,
+                        ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        self.settings_wp_status_dd,
+                        ft.Text("Categories & tags are derived from the note's place in "
+                                "the vault — the part WP can't know. A note's frontmatter "
+                                "(visibility / wp_password / wp_categories / wp_tags) "
+                                "overrides the auto policy.",
+                                size=11, color=ft.Colors.OUTLINE),
+                        self.settings_wp_category_dd,
+                        self.settings_wp_projtag_switch,
+                        self.settings_wp_notetags_switch,
+                        self.settings_wp_tagexclude_field,
+                        ft.Container(height=8),
                         ft.Text("GENERATION", size=10, weight=ft.FontWeight.BOLD,
                                 color=ft.Colors.OUTLINE),
                         self.settings_temp_field,
@@ -5839,6 +5971,17 @@ class WorkbenchApp:
         cfg.delegate_timeout = _num(self.settings_delegate_timeout_field, int, cfg.delegate_timeout, 1)
         cfg.delegate_terminal_command = (self.settings_delegate_term_field.value or "").strip()
         cfg.cli_session_command = (self.settings_cli_session_field.value or "claude").strip()
+        # Publishing (WordPress.com)
+        cfg.wpcom_site = (self.settings_wp_site_field.value or "").strip()
+        cfg.wpcom_client_id = (self.settings_wp_clientid_field.value or "").strip()
+        cfg.wpcom_client_secret = (self.settings_wp_secret_field.value or "").strip()
+        cfg.wpcom_username = (self.settings_wp_user_field.value or "").strip()
+        cfg.wpcom_password = (self.settings_wp_pass_field.value or "").strip()
+        cfg.publish_default_status = (self.settings_wp_status_dd.value or "draft").strip()
+        cfg.publish_auto_category = (self.settings_wp_category_dd.value or "area").strip()
+        cfg.publish_add_project_tag = bool(self.settings_wp_projtag_switch.value)
+        cfg.publish_include_note_tags = bool(self.settings_wp_notetags_switch.value)
+        cfg.publish_tag_exclude = (self.settings_wp_tagexclude_field.value or "").strip()
         # Reseed the per-message temperature control to the new default.
         self._chat_temperature = cfg.temperature
         self._sync_temp_btn()
@@ -5871,6 +6014,41 @@ class WorkbenchApp:
             self.settings_save_status.value = f"Save failed: {ex}"
             self.settings_save_status.color = ft.Colors.ERROR
         self.page.update()
+
+    def _on_test_wp_connection(self, e):
+        """Mint a token from the fields as currently typed (no save needed) so you
+        can verify WordPress.com creds before publishing. Runs off the UI thread."""
+        creds = publish.WPCreds(
+            client_id=(self.settings_wp_clientid_field.value or "").strip(),
+            client_secret=(self.settings_wp_secret_field.value or "").strip(),
+            username=(self.settings_wp_user_field.value or "").strip(),
+            password=(self.settings_wp_pass_field.value or "").strip(),
+            site=(self.settings_wp_site_field.value or "").strip(),
+        )
+        self.settings_wp_test_status.value = "Testing…"
+        self.settings_wp_test_status.color = ft.Colors.OUTLINE
+        self.page.update()
+
+        def run():
+            try:
+                tok = publish.mint_token(creds)
+                msg, color = f"✓ Connected (token {tok[:6]}…)", ft.Colors.TERTIARY
+            except publish.PublishError as ex:
+                msg, color = str(ex), ft.Colors.ERROR
+            except Exception as ex:
+                msg, color = f"Error: {ex}", ft.Colors.ERROR
+
+            async def _fin():
+                self.settings_wp_test_status.value = msg
+                self.settings_wp_test_status.color = color
+                self.page.update()
+
+            try:
+                self.page.run_task(_fin)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _on_save_and_reload_vault(self, e):
         """Persist the vault path, then reload all vault-derived state from it.

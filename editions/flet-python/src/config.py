@@ -104,6 +104,14 @@ class Config:
     # Default publish status when a note has no `publish:` field. Draft-first is
     # the safe default — nothing goes live by accident; review on WP, then publish.
     publish_default_status: str = "draft"  # draft | publish
+    # --- Auto category/tag policy (the vault-aware part WP can't do itself) ---
+    # On publish, derive a WP category + tags from the note's place in the vault.
+    publish_auto_category: str = "area"    # "area" | "project" | "none"
+    publish_add_project_tag: bool = True   # add the project name as a WP tag
+    publish_include_note_tags: bool = True  # include the note's own `tags:` as WP tags
+    # Vault-internal tags that must never leak to a public post (comma list,
+    # case-insensitive). A note can still override via frontmatter `wp_tags:`.
+    publish_tag_exclude: str = "inbox,backlog,demand-probe,draft,private,test"
     # Git TUI launched by the "Open in lazygit" buttons (vault on Home + each
     # project's working_dir card). It's a terminal app, so it rides the same
     # interactive terminal template above ({dir}/{cmd}). Swap for gitui/tig/etc.

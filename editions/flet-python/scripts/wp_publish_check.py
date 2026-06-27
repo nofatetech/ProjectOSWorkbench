@@ -78,7 +78,7 @@ def _pure_tests() -> int:
             "# Hello World\n\nA paragraph with a [[wikilink]].\n",
             encoding="utf-8")
 
-        payload, result, post_id = publish.build_payload(note, default_status="draft")
+        payload, result, post_id = publish.build_payload(note)
         check("payload title", payload["title"] == "Hello World")
         check("payload status draft", payload["status"] == "draft")
         check("payload tags joined", payload.get("tags") == "demo,test")
@@ -91,6 +91,48 @@ def _pure_tests() -> int:
         check("dry-run action", dry.action == "dry-run")
         check("dry-run carries html", dry.html_len > 0 and "<p>" in dry.html)
         check("dry-run wrote nothing", "wp_post_id" not in note.read_text())
+
+        # --- category/tag policy ---
+        opts = publish.PublishOptions(
+            category="Civic-SENACYT", extra_tags=["My Project"],
+            include_note_tags=True, tag_exclude=["test"])
+        pl, res, _ = publish.build_payload(note, opts)
+        check("policy: category from area", pl.get("categories") == "Civic-SENACYT")
+        check("policy: project tag added", "My Project" in res.tags)
+        check("policy: note tag kept", "demo" in res.tags)
+        check("policy: excluded tag dropped ('test')", "test" not in res.tags)
+        check("policy: result carries cats/tags", res.categories == ["Civic-SENACYT"])
+
+        # exclude is case-insensitive + dedupe
+        opts2 = publish.PublishOptions(extra_tags=["Demo"], tag_exclude=["DEMO"])
+        _, res2, _ = publish.build_payload(note, opts2)
+        check("policy: exclude case-insensitive", "Demo" not in res2.tags
+              and "demo" not in [t.lower() for t in res2.tags])
+
+        # --- visibility / password ---
+        opts_priv = publish.PublishOptions(status="publish", visibility="private")
+        plv, resv, _ = publish.build_payload(note, opts_priv)
+        check("visibility private → status private", plv["status"] == "private")
+        opts_pwd = publish.PublishOptions(status="publish", visibility="password",
+                                          password="s3cret")
+        plp, _, _ = publish.build_payload(note, opts_pwd)
+        check("visibility password → password field", plp.get("password") == "s3cret")
+        check("visibility password keeps status", plp["status"] == "publish")
+        check("visibility synonym 'password-protected' → password",
+              publish._normalize_visibility("password-protected") == "password")
+        check("visibility synonym unknown → public",
+              publish._normalize_visibility("whatever") == "public")
+
+        # --- frontmatter overrides the policy ---
+        note2 = Path(d) / "override.md"
+        note2.write_text(
+            "---\ntype: post\ntags: [a]\nwp_categories: [News]\n"
+            "wp_tags: [only, these]\nvisibility: private\n---\n# T\nbody\n",
+            encoding="utf-8")
+        plo, reso, _ = publish.build_payload(note2, opts)
+        check("fm wp_categories overrides", plo.get("categories") == "News")
+        check("fm wp_tags overrides", reso.tags == ["only", "these"])
+        check("fm visibility overrides (no opts vis)", plo["status"] == "private")
 
         # writeback round-trip (simulate a successful create)
         publish._writeback(note, "12345", "https://myweb1712.wordpress.com/?p=12345", "draft")
@@ -130,11 +172,12 @@ def _live(argv) -> int:
             note = argv[argv.index(flag) + 1]
             print(f"\n[live] {'dry-run' if dry else 'PUBLISH'} {note}")
             try:
-                res = publish.publish_note(
-                    creds, note, dry_run=dry,
+                opts = publish.PublishOptions(
                     default_status=getattr(cfg, "publish_default_status", "draft"))
+                res = publish.publish_note(creds, note, dry_run=dry, options=opts)
                 print(f"  action={res.action} status={res.status} "
                       f"title={res.title!r} url={res.url} id={res.post_id} "
+                      f"cats={res.categories} tags={res.tags} "
                       f"html_len={res.html_len}")
                 if dry:
                     print("  --- HTML preview (first 400) ---")

@@ -20,7 +20,7 @@ a later `publish_note` agent tool both call publish_note().
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -37,6 +37,13 @@ MD_EXTENSIONS = ["extra", "sane_lists", "smarty"]
 _FM_RE = re.compile(r"^---\n(.*?)\n---\n?(.*)$", re.DOTALL)
 _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 _TRUTHY_STATUS = {"publish", "public", "live", "true", "yes", "1"}
+# Visibility synonyms → the three canonical values the UI/dropdown uses.
+_VISIBILITY_MAP = {
+    "": "public", "public": "public", "publish": "public", "open": "public",
+    "private": "private", "hidden": "private",
+    "password": "password", "password-protected": "password",
+    "protected": "password", "pwd": "password",
+}
 
 
 class PublishError(Exception):
@@ -75,14 +82,34 @@ def creds_from_config(cfg) -> WPCreds:
 
 
 @dataclass
+class PublishOptions:
+    """How to publish — the vault-aware policy + per-publish overrides.
+
+    Built by the app from config + the note's project/area; a note's own
+    frontmatter (`visibility:`/`wp_password:`/`wp_categories:`/`wp_tags:`) takes
+    precedence over these, so the vault stays the source of truth."""
+    default_status: str = "draft"          # used when neither `status` nor `publish:` is set
+    status: Optional[str] = None           # explicit per-call override of the note's `publish:`
+    category: str = ""                     # auto WP category (e.g. the note's area name); "" = none
+    extra_tags: list = field(default_factory=list)   # tags to add (e.g. the project name)
+    include_note_tags: bool = True         # include the note's own `tags:`
+    tag_exclude: list = field(default_factory=list)  # tag names to strip (internal/never-public)
+    visibility: str = ""                   # "" | "public" | "private" | "password"
+    password: str = ""                     # used when visibility == "password"
+
+
+@dataclass
 class PublishResult:
     action: str          # "created" | "updated" | "dry-run"
-    status: str          # "draft" | "publish"
+    status: str          # "draft" | "publish" | "private"
     title: str
     url: str = ""
     post_id: str = ""
     html_len: int = 0
     html: str = ""       # populated only on dry-run, for preview
+    categories: list = field(default_factory=list)
+    tags: list = field(default_factory=list)
+    visibility: str = "public"
 
 
 # --- frontmatter writeback (targeted, churn-free) ---------------------------
@@ -150,10 +177,31 @@ def _normalize_status(raw, default: str = "draft") -> str:
     return "publish" if s in _TRUTHY_STATUS else "draft"
 
 
-def build_payload(path: Path, status: Optional[str] = None,
-                  default_status: str = "draft") -> tuple[dict, PublishResult, str]:
+def _normalize_visibility(raw) -> str:
+    """Map visibility synonyms (e.g. 'password-protected') to one of the three
+    canonical values: public | private | password. Unknown → public."""
+    return _VISIBILITY_MAP.get(str(raw or "").strip().lower(), "public")
+
+
+def _dedupe_ci(items: list) -> list:
+    """De-duplicate preserving order, case-insensitively."""
+    seen, out = set(), []
+    for it in items:
+        k = it.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(it)
+    return out
+
+
+def build_payload(path: Path,
+                  options: Optional[PublishOptions] = None
+                  ) -> tuple[dict, PublishResult, str]:
     """Pure: read the note → (WP REST payload, partial PublishResult, post_id).
-    No network. The button/tool and the dry-run path both build through here."""
+    No network. The button/tool and the dry-run path both build through here.
+    Applies the category/tag policy + visibility; note frontmatter overrides
+    `options` (vault = source of truth)."""
+    opts = options or PublishOptions()
     path = Path(path)
     if not path.is_file():
         raise PublishError(f"Note not found: {path}")
@@ -161,23 +209,53 @@ def build_payload(path: Path, status: Optional[str] = None,
     meta, body = post.metadata, (post.content or "")
 
     eff_status = _normalize_status(
-        status if status is not None else meta.get("publish", default_status),
-        default_status)
+        opts.status if opts.status is not None else meta.get("publish", opts.default_status),
+        opts.default_status)
     title, tsource = _resolve_title(meta, body, path)
     html = _to_html(_prep_body(body, tsource))
     post_id = str(meta.get("wp_post_id") or "").strip()
 
-    payload: dict = {"title": title, "content": html, "status": eff_status}
-    tags = _norm_tags(meta.get("tags"))
+    # Visibility: an explicit option (the publish dialog) wins; else the note's
+    # frontmatter `visibility:`; else public. `private` rides on the status field;
+    # `password` keeps the status and sets a post password. Synonyms normalized.
+    visibility = _normalize_visibility(opts.visibility or meta.get("visibility"))
+    password = opts.password or str(meta.get("wp_password") or "")
+    payload_status = "private" if visibility == "private" else eff_status
+
+    payload: dict = {"title": title, "content": html, "status": payload_status}
+    if visibility == "password" and password:
+        payload["password"] = password
+
+    # Categories: explicit frontmatter `wp_categories:` overrides the auto policy.
+    if meta.get("wp_categories") is not None:
+        cats = _norm_tags(meta.get("wp_categories"))
+    else:
+        cats = [opts.category] if opts.category.strip() else []
+    cats = _dedupe_ci([c for c in cats if c.strip()])
+    if cats:
+        payload["categories"] = ",".join(cats)
+
+    # Tags: explicit frontmatter `wp_tags:` overrides; else note tags (optional) +
+    # extra tags (e.g. project name), minus the never-public exclude list.
+    if meta.get("wp_tags") is not None:
+        tags = _norm_tags(meta.get("wp_tags"))
+    else:
+        tags = (_norm_tags(meta.get("tags")) if opts.include_note_tags else [])
+        tags = list(tags) + [t for t in opts.extra_tags if t and t.strip()]
+        excl = {t.lower() for t in opts.tag_exclude}
+        tags = [t for t in tags if t.lower() not in excl]
+    tags = _dedupe_ci([t for t in tags if t.strip()])
     if tags:
         payload["tags"] = ",".join(tags)
+
     if meta.get("slug"):
         payload["slug"] = str(meta["slug"]).strip()
     if meta.get("excerpt"):
         payload["excerpt"] = str(meta["excerpt"]).strip()
 
-    result = PublishResult(action="", status=eff_status, title=title,
-                           post_id=post_id, html_len=len(html), html=html)
+    result = PublishResult(action="", status=payload_status, title=title,
+                           post_id=post_id, html_len=len(html), html=html,
+                           categories=cats, tags=tags, visibility=visibility)
     return payload, result, post_id
 
 
@@ -252,19 +330,19 @@ def _writeback(path: Path, post_id: str, url: str, status: str) -> None:
         path.write_text(f"---\n{fm}\n---\n\n{text}", encoding="utf-8")
 
 
-def publish_note(creds: WPCreds, path, *, status: Optional[str] = None,
-                 default_status: str = "draft", dry_run: bool = False,
+def publish_note(creds: WPCreds, path, *,
+                 options: Optional[PublishOptions] = None,
+                 dry_run: bool = False,
                  timeout: float = 30.0) -> PublishResult:
     """Publish (or update) a note on WordPress.com.
 
-    status:         override the note's `publish:` intent for this call.
-    default_status: used when neither `status` nor `publish:` is set (config default).
-    dry_run:        build everything, render HTML, but make NO network call and
-                    write NOTHING back. Use to preview before going live.
+    options:  the category/tag policy + visibility/status overrides (PublishOptions).
+              Note frontmatter still wins over these.
+    dry_run:  build everything, render HTML + computed categories/tags, but make NO
+              network call and write NOTHING back. Use to preview before going live.
     """
     path = Path(path)
-    payload, result, post_id = build_payload(path, status=status,
-                                             default_status=default_status)
+    payload, result, post_id = build_payload(path, options)
     if dry_run:
         result.action = "dry-run"
         return result
@@ -288,7 +366,10 @@ def publish_note(creds: WPCreds, path, *, status: Optional[str] = None,
     data = r.json()
     new_id = str(data.get("ID") or data.get("id") or post_id)
     post_url = data.get("URL") or data.get("short_URL") or data.get("link") or ""
-    _writeback(path, new_id, post_url, result.status)
+    # `publish:` frontmatter records the draft/publish *intent* — keep visibility
+    # (private/password) out of it (that lives in `visibility:`/`wp_password:`).
+    writeback_status = "publish" if result.status in ("publish", "private") else "draft"
+    _writeback(path, new_id, post_url, writeback_status)
 
     result.action = action
     result.url = post_url

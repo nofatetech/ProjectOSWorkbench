@@ -139,7 +139,12 @@ accepts any Material icon name (`smart_toy`, `face`, `psychology`, …).
 - **Publish to the web.** A button on a project's posts/journals publishes a note
   to WordPress.com (REST v1.1, draft-first). The result is written back into the
   note's own frontmatter (`wp_post_id` / `published_url`), so re-publishing
-  *updates* the same post instead of duplicating it.
+  *updates* the same post instead of duplicating it. Categories/tags are derived
+  from the note's place in the vault (category = `area`, tags = project + the
+  note's `tags:`, minus a never-public exclude list); per-publish visibility
+  (public / private / password) and frontmatter overrides
+  (`visibility` / `wp_password` / `wp_categories` / `wp_tags`). Configure under
+  **Settings → PUBLISHING** (with a "Test connection" button).
 - **Themeable.** Light "Platinum" surface theme + configurable title styles.
 
 ## Tools
