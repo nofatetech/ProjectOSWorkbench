@@ -159,8 +159,11 @@ When tools are enabled (default), the agent can call:
 | `list_dir` | list a folder |
 | `run_shell` | run a shell command in the project's `working_dir` |
 | `delegate_to_claude_code` | (opt-in) run a headless CLI agent and poll for the result |
+| `publish_note` | (opt-in) publish/update a note on WordPress.com (draft-first; auto category/tags) |
 
-Toggle them off in **Settings → Enable tools** for a read-only chat.
+Toggle them off in **Settings → Enable tools** for a read-only chat. `publish_note`
+is off by default — turn it on under **Settings → PUBLISHING** ("Let the chat
+agent publish").
 
 ## Trust mode — what the app can do to your machine
 

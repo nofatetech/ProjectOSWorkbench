@@ -15,7 +15,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 READ_CAP = 24_000     # chars returned from a file read
 LIST_CAP = 200        # entries from list_dir
@@ -35,6 +35,12 @@ class ToolContext:
     delegate_permission_mode: str = "bypassPermissions"
     delegate_allowed_tools: str = ""
     delegate_timeout: int = 600
+    # Publishing: only advertised when enabled. `publish_fn` is supplied by the
+    # app (main.py) — a callable(args: dict) -> str — so the vault-aware policy
+    # (category from area, tags from project, etc., which needs AppState) stays in
+    # the app while this module stays a thin executor. Signature mirrors a tool.
+    publish_enabled: bool = False
+    publish_fn: Optional[Callable[[dict], str]] = None
 
 
 # --- Headless delegation: background job registry ---------------------------
@@ -166,19 +172,48 @@ DELEGATE_SCHEMAS = [
             "required": ["job_id"]}}},
 ]
 
+# Advertised only when publishing is enabled (see schemas_for). Publishes a note
+# to WordPress.com via the app's vault-aware policy. Category/tags are derived
+# automatically from the note's project/area — the agent doesn't set them; it just
+# names the note (and optionally status/visibility).
+PUBLISH_SCHEMAS = [
+    {"type": "function", "function": {
+        "name": "publish_note",
+        "description": (
+            "Publish (or update) a vault note as a WordPress.com post. Draft-first. "
+            "Re-publishing the same note UPDATES its existing post (no duplicate). "
+            "Categories/tags are set automatically from the note's project & area — "
+            "do not pass them. Returns the live post URL on success."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string",
+                     "description": "note path (vault-relative or absolute)"},
+            "status": {"type": "string", "enum": ["draft", "publish"],
+                       "description": "optional; defaults to the configured default (draft)"},
+            "visibility": {"type": "string", "enum": ["public", "private", "password"],
+                           "description": "optional post visibility"},
+            "password": {"type": "string",
+                         "description": "optional; required only when visibility=password"}},
+            "required": ["path"]}}},
+]
+
 
 # Tools that change state on disk / spawn processes. The optional confirm dialog
 # (Config.tool_confirm) gates only these; read_vault_note / list_dir are
 # read-only and never prompted. execute_tool itself is unguarded — the gate lives
 # in the dispatch loop, which owns the UI, so this module stays UI-free.
 MUTATING_TOOLS = {"write_vault_note", "move_note", "run_shell",
-                  "delegate_to_claude_code"}
+                  "delegate_to_claude_code", "publish_note"}
 
 
 def schemas_for(ctx: ToolContext) -> list:
     """Tool schemas advertised to the model for this context — base tools plus
-    delegation tools when enabled."""
-    return TOOL_SCHEMAS + DELEGATE_SCHEMAS if ctx.delegate_enabled else list(TOOL_SCHEMAS)
+    delegation / publishing tools when enabled."""
+    schemas = list(TOOL_SCHEMAS)
+    if ctx.delegate_enabled:
+        schemas += DELEGATE_SCHEMAS
+    if ctx.publish_enabled:
+        schemas += PUBLISH_SCHEMAS
+    return schemas
 
 
 def _resolve(ctx: ToolContext, path: str) -> Path:
@@ -228,6 +263,13 @@ def execute_tool(name: str, args: dict, ctx: ToolContext) -> str:
             return (f"Started delegation job {job_id} in the background. "
                     f"Call check_delegation(\"{job_id}\") to poll for the result "
                     f"(it may take a minute or more).")
+
+        if name == "publish_note":
+            if not ctx.publish_enabled:
+                return "[publishing is disabled — enable it in Settings → PUBLISHING]"
+            if ctx.publish_fn is None:
+                return "[publish_note unavailable in this context]"
+            return ctx.publish_fn(args)
 
         if name == "check_delegation":
             with _JOBS_LOCK:

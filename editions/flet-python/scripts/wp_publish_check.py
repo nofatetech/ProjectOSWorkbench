@@ -148,6 +148,22 @@ def _pure_tests() -> int:
               note.read_text().count("wp_post_id:") == 1)
         check("writeback updated publish intent", "publish: publish" in note.read_text())
 
+    # --- publish_note agent tool wiring (tools.py) ---
+    import tools
+
+    def names(schemas):
+        return {s["function"]["name"] for s in schemas}
+    off = tools.ToolContext(vault_root=Path("/tmp"))
+    on = tools.ToolContext(vault_root=Path("/tmp"), publish_enabled=True,
+                           publish_fn=lambda a: f"published {a.get('path')}")
+    check("tool: hidden when publish disabled", "publish_note" not in names(tools.schemas_for(off)))
+    check("tool: advertised when enabled", "publish_note" in names(tools.schemas_for(on)))
+    check("tool: in MUTATING_TOOLS", "publish_note" in tools.MUTATING_TOOLS)
+    check("tool: disabled guard message",
+          "disabled" in tools.execute_tool("publish_note", {"path": "x.md"}, off).lower())
+    check("tool: routes to publish_fn",
+          tools.execute_tool("publish_note", {"path": "x.md"}, on) == "published x.md")
+
     print()
     if fails:
         print(f"PURE TESTS: {fails} FAILED")

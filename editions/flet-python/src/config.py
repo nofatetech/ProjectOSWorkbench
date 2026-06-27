@@ -112,6 +112,10 @@ class Config:
     # Vault-internal tags that must never leak to a public post (comma list,
     # case-insensitive). A note can still override via frontmatter `wp_tags:`.
     publish_tag_exclude: str = "inbox,backlog,demand-probe,draft,private,test"
+    # Let the chat agent publish via a `publish_note` tool. Off by default — it's
+    # an outward-facing action (posts to the web), so it's opt-in like delegation.
+    # Still draft-first; obeys the same tool-confirm gate as other mutating tools.
+    publish_enabled: bool = False
     # Git TUI launched by the "Open in lazygit" buttons (vault on Home + each
     # project's working_dir card). It's a terminal app, so it rides the same
     # interactive terminal template above ({dir}/{cmd}). Swap for gitui/tig/etc.

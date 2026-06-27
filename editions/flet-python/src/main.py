@@ -252,6 +252,7 @@ def build_messages_for_general_agent(
     context_token_cap: int = VAULT_CONTEXT_TOKEN_CAP,
     tools_available: bool = False,
     delegate_available: bool = False,
+    publish_available: bool = False,
     system_override: Optional[str] = None,
 ) -> list[dict]:
     """Single-agent chat (v0.2): one system prompt assembled from an optional user
@@ -290,6 +291,14 @@ def build_messages_for_general_agent(
                 "delegate_to_claude_code(task) — it runs the Claude Code CLI in the "
                 "background and returns a job_id; poll it with check_delegation(job_id). "
                 "Use this for real code changes; run_shell is for quick one-offs."
+            )
+        if publish_available:
+            parts.append(
+                "\nTo publish a note to the web, call publish_note(path) — it posts "
+                "to WordPress.com (draft-first; re-publishing updates the same post). "
+                "Categories and tags are set automatically from the note's project & "
+                "area, so do NOT pass them. Optional: status (draft/publish), "
+                "visibility (public/private/password)."
             )
 
     others = [a for a in persona_library if a.name != general.name]
@@ -1324,6 +1333,9 @@ class WorkbenchApp:
             label="Never-public tags (comma list)",
             value=getattr(cfg, "publish_tag_exclude", ""))
         self.settings_wp_test_status = ft.Text("", size=11, selectable=True)
+        self.settings_wp_agent_switch = ft.Switch(
+            label="Let the chat agent publish (publish_note tool)",
+            value=bool(getattr(cfg, "publish_enabled", False)))
         self.settings_temp_field = ft.TextField(
             label="Default temperature (0.0–2.0)",
             value=f"{cfg.temperature:.1f}",
@@ -3032,6 +3044,46 @@ class WorkbenchApp:
             include_note_tags=bool(getattr(cfg, "publish_include_note_tags", True)),
             tag_exclude=excl, visibility=visibility, password=password,
         )
+
+    def _tool_publish_note(self, args: dict) -> str:
+        """Executor for the agent's `publish_note` tool (wired into ToolContext).
+        Runs on the dispatch worker thread, so the synchronous network publish is
+        fine here. Reuses the same vault-aware policy as the button; returns a
+        human-readable result string for the model."""
+        raw = str(args.get("path", "")).strip()
+        if not raw:
+            return "[publish_note: missing 'path']"
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = VAULT_PATH / raw
+        if not path.is_file():
+            return f"[publish_note: note not found: {path}]"
+        cfg = self.state.config
+        creds = publish.creds_from_config(cfg)
+        try:
+            creds.validate()
+        except publish.PublishError as ex:
+            return f"[publish_note: {ex}]"
+        project = self._project_for_path(path)
+        opts = self._publish_options_for(
+            project, visibility=str(args.get("visibility") or "").strip(),
+            password=str(args.get("password") or "").strip())
+        if args.get("status"):
+            opts.status = str(args["status"]).strip()
+        try:
+            res = publish.publish_note(creds, path, options=opts)
+        except publish.PublishError as ex:
+            return f"[publish_note failed: {ex}]"
+        except Exception as ex:
+            return f"[publish_note error: {ex}]"
+        parts = [f"{res.action} ({res.status}): {res.title}"]
+        if res.url:
+            parts.append(f"url={res.url}")
+        if res.categories:
+            parts.append(f"categories={', '.join(res.categories)}")
+        if res.tags:
+            parts.append(f"tags={', '.join(res.tags)}")
+        return " · ".join(parts)
 
     def _on_publish_note(self, path: Path, project: Optional[Project] = None):
         """Confirm (with visibility/password + a category/tag preview), then publish
@@ -5363,6 +5415,11 @@ class WorkbenchApp:
                         self.settings_wp_projtag_switch,
                         self.settings_wp_notetags_switch,
                         self.settings_wp_tagexclude_field,
+                        self.settings_wp_agent_switch,
+                        ft.Text("Off by default (publishing is outward-facing). When "
+                                "on, the chat agent can call publish_note; it's still "
+                                "draft-first and obeys “Ask before changes”.",
+                                size=11, color=ft.Colors.OUTLINE),
                         ft.Container(height=8),
                         ft.Text("GENERATION", size=10, weight=ft.FontWeight.BOLD,
                                 color=ft.Colors.OUTLINE),
@@ -5982,6 +6039,7 @@ class WorkbenchApp:
         cfg.publish_add_project_tag = bool(self.settings_wp_projtag_switch.value)
         cfg.publish_include_note_tags = bool(self.settings_wp_notetags_switch.value)
         cfg.publish_tag_exclude = (self.settings_wp_tagexclude_field.value or "").strip()
+        cfg.publish_enabled = bool(self.settings_wp_agent_switch.value)
         # Reseed the per-message temperature control to the new default.
         self._chat_temperature = cfg.temperature
         self._sync_temp_btn()
@@ -6573,6 +6631,7 @@ class WorkbenchApp:
             context_token_cap=cfg.context_token_cap,
             tools_available=cfg.tools_enabled,
             delegate_available=cfg.tools_enabled and cfg.delegate_enabled,
+            publish_available=cfg.tools_enabled and cfg.publish_enabled,
         )
         return msgs[0]["content"]
 
@@ -6664,6 +6723,7 @@ class WorkbenchApp:
             context_token_cap=cfg.context_token_cap,
             tools_available=cfg.tools_enabled,
             delegate_available=cfg.tools_enabled and cfg.delegate_enabled,
+            publish_available=cfg.tools_enabled and cfg.publish_enabled,
             system_override=thread.system_prompt_override,
         )
         self._dump_prompt(messages, general.model)
@@ -6695,6 +6755,8 @@ class WorkbenchApp:
             delegate_permission_mode=cfg.delegate_permission_mode,
             delegate_allowed_tools=cfg.delegate_allowed_tools,
             delegate_timeout=cfg.delegate_timeout,
+            publish_enabled=cfg.publish_enabled,
+            publish_fn=self._tool_publish_note,
         )
         tools = schemas_for(tool_ctx) if cfg.tools_enabled else None
 
