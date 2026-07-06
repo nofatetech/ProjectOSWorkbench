@@ -158,6 +158,8 @@ When tools are enabled (default), the agent can call:
 | `move_note` | move/rename a note |
 | `list_dir` | list a folder |
 | `run_shell` | run a shell command in the project's `working_dir` |
+| `web_search` | search the web (DuckDuckGo, no API key) — top title/URL/snippet |
+| `fetch_url` | fetch a page/URL and return its readable text (HTML stripped) |
 | `delegate_to_claude_code` | (opt-in) run a headless CLI agent and poll for the result |
 | `publish_note` | (opt-in) publish/update a note on WordPress.com (draft-first; auto category/tags) |
 
@@ -174,6 +176,8 @@ CLI. With tools enabled and a real model selected, it acts on your machine
 - `write_vault_note` / `move_note` create, overwrite, and move files in your
   vault directly.
 - `run_shell` runs arbitrary shell commands in the project's `working_dir`.
+- `web_search` / `fetch_url` make outbound requests (to DuckDuckGo and to any URL
+  the agent fetches) — read-only, but the query/URL leaves your machine.
 - `delegate_to_claude_code` (off by default) launches a headless CLI agent under
   `bypassPermissions`.
 

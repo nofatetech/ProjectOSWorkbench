@@ -9,19 +9,29 @@ execute_tool() never raises — failures come back as strings so the model can
 read the error and adjust.
 """
 
+import html
+import re
 import shlex
 import subprocess
 import threading
 import uuid
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+
+import httpx
 
 READ_CAP = 24_000     # chars returned from a file read
 LIST_CAP = 200        # entries from list_dir
 SHELL_CAP = 8_000     # chars of shell output
 SHELL_TIMEOUT = 60    # seconds
 DELEGATE_CAP = 16_000  # chars of a delegated run's output returned to the agent
+WEB_CAP = 8_000       # chars of readable page text returned from fetch_url
+WEB_TIMEOUT = 20      # seconds for a web fetch / search
+WEB_RESULTS = 6       # default search results returned
+WEB_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
 
 
 @dataclass
@@ -112,6 +122,84 @@ def _start_delegation(ctx: ToolContext, task: str) -> str:
     return job.id
 
 
+# --- Web browsing: fetch a URL + no-key search ------------------------------
+# Read-only network tools. fetch_url GETs a page and returns readable text;
+# web_search hits DuckDuckGo's keyless HTML endpoint and returns the top hits.
+# No API key, no new dependency (httpx is already the OpenRouter/Ollama client).
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_RE = re.compile(r"<(script|style|noscript)\b.*?</\1>", re.I | re.S)
+_WS_RE = re.compile(r"[ \t]*\n[ \t]*")
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def _html_to_text(raw: str) -> str:
+    """Crude HTML → readable text: drop scripts/styles, strip tags, unescape
+    entities, collapse whitespace. Good enough to feed a page to the model
+    without pulling in bs4/readability."""
+    raw = _SCRIPT_RE.sub(" ", raw)
+    raw = re.sub(r"</(p|div|li|h[1-6]|tr|br|section|article)>", "\n", raw, flags=re.I)
+    text = _TAG_RE.sub(" ", raw)
+    text = html.unescape(text)
+    text = _WS_RE.sub("\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def _ddg_unwrap(href: str) -> str:
+    """DuckDuckGo sometimes wraps result links in //duckduckgo.com/l/?uddg=…
+    redirects — pull the real target out."""
+    if "uddg=" in href:
+        q = urllib.parse.urlparse(href).query
+        target = urllib.parse.parse_qs(q).get("uddg", [""])[0]
+        if target:
+            return target
+    return "https:" + href if href.startswith("//") else href
+
+
+def _fetch_url(url: str) -> str:
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    try:
+        r = httpx.get(url, headers={"User-Agent": WEB_UA}, timeout=WEB_TIMEOUT,
+                      follow_redirects=True)
+    except Exception as ex:
+        return f"[fetch failed for {url}: {ex}]"
+    ctype = r.headers.get("content-type", "")
+    if "html" in ctype or "<html" in r.text[:2000].lower():
+        m = _TITLE_RE.search(r.text)
+        title = html.unescape(_TAG_RE.sub("", m.group(1)).strip()) if m else ""
+        body = _html_to_text(r.text)
+        head = f"# {title}\n" if title else ""
+    else:
+        head, body = "", r.text
+    body = body if len(body) <= WEB_CAP else body[:WEB_CAP] + "\n…[truncated]"
+    return f"{head}({r.status_code}) {r.url}\n\n{body}".strip()
+
+
+def _web_search(query: str, count: int = WEB_RESULTS) -> str:
+    try:
+        r = httpx.post("https://html.duckduckgo.com/html/", data={"q": query},
+                       headers={"User-Agent": WEB_UA}, timeout=WEB_TIMEOUT,
+                       follow_redirects=True)
+    except Exception as ex:
+        return f"[search failed for {query!r}: {ex}]"
+    links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                       r.text, re.I | re.S)
+    snippets = re.findall(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+                          r.text, re.I | re.S)
+    if not links:
+        return f"[no results for {query!r}]"
+    out = [f"Results for {query!r}:"]
+    for i, (href, title) in enumerate(links[:max(1, count)]):
+        url = _ddg_unwrap(href)
+        title = html.unescape(_TAG_RE.sub("", title)).strip()
+        snip = html.unescape(_TAG_RE.sub("", snippets[i])).strip() if i < len(snippets) else ""
+        out.append(f"\n{i + 1}. {title}\n   {url}" + (f"\n   {snip}" if snip else ""))
+    return "\n".join(out)
+
+
 # OpenAI/OpenRouter-style function schemas advertised to the model.
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
@@ -147,6 +235,23 @@ TOOL_SCHEMAS = [
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string"}},
             "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": ("Search the web (DuckDuckGo). Returns the top results as "
+                        "title + URL + snippet. Use to find sources, then fetch_url "
+                        "the promising ones to read them."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"},
+            "count": {"type": "integer", "description": f"how many results (default {WEB_RESULTS})"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "fetch_url",
+        "description": ("Fetch a web page (or any URL) and return its readable text "
+                        "content, HTML stripped. Use to read an article, doc, or a "
+                        "link the user pasted."),
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "http(s) URL; a bare domain is upgraded to https://"}},
+            "required": ["url"]}}},
 ]
 
 # Advertised only when delegation is enabled (see schemas_for). Heavy coding work
@@ -255,6 +360,12 @@ def execute_tool(name: str, args: dict, ctx: ToolContext) -> str:
             if len(out) > SHELL_CAP:
                 out = out[:SHELL_CAP] + "\n…[truncated]"
             return f"(exit {r.returncode}, cwd {cwd})\n{out}".strip()
+
+        if name == "web_search":
+            return _web_search(args["query"], int(args.get("count") or WEB_RESULTS))
+
+        if name == "fetch_url":
+            return _fetch_url(args["url"])
 
         if name == "delegate_to_claude_code":
             if not ctx.delegate_enabled:
