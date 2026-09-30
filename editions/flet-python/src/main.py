@@ -38,6 +38,7 @@ from store import save_thread, load_thread_dicts
 from tools import ToolContext, execute_tool, schemas_for, MUTATING_TOOLS
 import publish
 import shopify_publish
+import shopify_products
 from models import (Agent, Turn, Thread, Area, Project, Task, Note, FileItem,
                     InboxItem, VaultEntry, OpenTab)
 from theme import (STATUS_COLORS, PLATINUM, _all_border, _bevel, _raised, _recessed, _sticky)
@@ -295,10 +296,11 @@ def build_messages_for_general_agent(
             )
         if publish_available:
             parts.append(
-                "\nTo publish a note to the web, call publish_note(path) — it posts "
-                "to the configured blog destination (draft-first; re-publishing "
-                "updates the same post). Tags are derived from the note's project. "
-                "Optional: status (draft/publish). WordPress also supports "
+                "\nTo publish a note to the web, call publish_note(path). A note "
+                "with type: product becomes a contact-first Shopify product; post "
+                "and journal notes use the configured blog. Publishing is draft-first "
+                "and re-publishing updates the same remote item. Tags come from the "
+                "note and project. Optional: status (draft/publish). WordPress also supports "
                 "visibility (public/private/password)."
             )
 
@@ -1365,7 +1367,7 @@ class WorkbenchApp:
         )
         # --- Publishing ---
         self.settings_provider_dd = ft.Dropdown(
-            label="Post destination",
+            label="Blog post destination",
             value=getattr(cfg, "publishing_provider", "shopify") or "shopify",
             options=[ft.dropdown.Option(key="shopify", text="Shopify blog"),
                      ft.dropdown.Option(key="wordpress", text="WordPress.com")])
@@ -2602,15 +2604,16 @@ class WorkbenchApp:
             )
         )
 
-        # Section: Posts / Blog / Journal (type: post or journal)
+        # Section: Posts / Journal / Products
         self.overview_content.controls.append(
             self._build_notes_section_card(
-                label="POSTS / JOURNAL",
+                label="POSTS / JOURNAL / PRODUCTS",
                 icon=ft.Icons.EDIT_NOTE,
                 notes=pc.posts,
-                caption="Notes with `type: post` or `type: journal` in the project folder.",
+                caption="Notes with `type: post`, `type: journal`, or `type: product`.",
                 project=p,
-                create=[("+ new post", "post"), ("+ new journal", "journal")],
+                create=[("+ new post", "post"), ("+ new journal", "journal"),
+                        ("+ new product", "product")],
                 publishable=True,
             )
         )
@@ -3085,14 +3088,15 @@ class WorkbenchApp:
         if err:
             self._toast(f"open in Obsidian failed: {err}")
 
-    # --- Publish to WordPress.com (v0.10) -----------------------------------
+    # --- Publish project notes ----------------------------------------------
     def _note_publish_state(self, path: Path) -> tuple[bool, str]:
-        """Read a note's frontmatter for an existing WP publish. Returns
-        (already_published, published_url) — drives the button's create↔update
-        label and the toast's Open action."""
+        """Read the destination ID and URL that drive a note's publish button."""
         try:
             post = frontmatter.load(str(path))
-            if getattr(self.state.config, "publishing_provider", "shopify") == "shopify":
+            if str(post.metadata.get("type") or "").strip().lower() == "product":
+                pid = str(post.metadata.get("shopify_product_id") or "").strip()
+                url = str(post.metadata.get("shopify_published_url") or "").strip()
+            elif getattr(self.state.config, "publishing_provider", "shopify") == "shopify":
                 pid = str(post.metadata.get("shopify_article_id") or "").strip()
                 url = str(post.metadata.get("shopify_published_url") or "").strip()
             else:
@@ -3159,6 +3163,35 @@ class WorkbenchApp:
         if not path.is_file():
             return f"[publish_note: note not found: {path}]"
         cfg = self.state.config
+        try:
+            note_meta = frontmatter.load(str(path)).metadata
+        except Exception as ex:
+            return f"[publish_note: could not read note: {ex}]"
+        if str(note_meta.get("type") or "").strip().lower() == "product":
+            if args.get("visibility") or args.get("password"):
+                return "[publish_note: Shopify products do not support subscriber visibility]"
+            product_creds = shopify_publish.creds_from_config(cfg)
+            project = self._project_for_path(path)
+            product_options = shopify_products.ProductOptions(
+                project_tag=project.name if project else "",
+                tag_exclude=[t.strip() for t in cfg.publish_tag_exclude.split(",")])
+            try:
+                product_creds.validate()
+                if args.get("status"):
+                    product_options.status = str(args["status"])
+                elif note_meta.get("shopify_product_id"):
+                    remote = shopify_products.get_product(
+                        product_creds, str(note_meta["shopify_product_id"]))
+                    product_options.status = (
+                        "publish" if remote.get("status") == "ACTIVE" else "draft")
+                product_res = shopify_products.publish_product(
+                    product_creds, path, options=product_options)
+            except shopify_publish.ShopifyPublishError as ex:
+                return f"[publish_note failed: {ex}]"
+            except Exception as ex:
+                return f"[publish_note error: {ex}]"
+            return (f"{product_res.action} product ({product_res.status}): "
+                    f"{product_res.title} · url={product_res.url}")
         if getattr(cfg, "publishing_provider", "shopify") == "shopify":
             if args.get("visibility") or args.get("password"):
                 return "[publish_note: subscriber visibility is not configured for Shopify]"
@@ -3234,12 +3267,16 @@ class WorkbenchApp:
             return ""
 
     def _on_publish_note(self, path: Path, project: Optional[Project] = None):
-        """Entry point for the Publish button. For a NEW post, open the dialog
-        immediately. For an UPDATE, first fetch the post's LIVE status/visibility
-        from WP (off the UI thread) so the dialog seeds from reality — this is what
-        stops an update from silently downgrading a live/password-protected post to
-        draft."""
+        """Route the publish button by note type, preserving remote status on update."""
         cfg = self.state.config
+        try:
+            note_type = str(frontmatter.load(str(path)).metadata.get("type") or "").strip().lower()
+        except Exception as ex:
+            self._toast(f"Could not read note: {ex}")
+            return
+        if note_type == "product":
+            self._on_publish_shopify_product(path, project)
+            return
         if getattr(cfg, "publishing_provider", "shopify") == "shopify":
             self._on_publish_shopify_note(path, project)
             return
@@ -3380,6 +3417,119 @@ class WorkbenchApp:
                 msg, url = f"Shopify publish failed: {ex}", ""
             except Exception as ex:
                 msg, url = f"Shopify publish error: {ex}", ""
+
+            async def finish():
+                self._toast(msg, url=url or None)
+                self.refresh()
+
+            try:
+                self.page.run_task(finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_publish_shopify_product(self, path: Path, project: Optional[Project] = None):
+        cfg = self.state.config
+        creds = shopify_publish.creds_from_config(cfg)
+        try:
+            creds.validate()
+            product_id = str(frontmatter.load(str(path)).metadata.get(
+                "shopify_product_id") or "").strip()
+        except Exception as ex:
+            self._toast(f"Could not prepare Shopify product: {ex}")
+            return
+        project = project or self._project_for_path(path)
+        if not product_id:
+            self._show_shopify_product_dialog(path, project, None)
+            return
+        self._toast("Checking Shopify product…")
+
+        def run():
+            try:
+                live = shopify_products.get_product(creds, product_id)
+                error = ""
+            except shopify_publish.ShopifyPublishError as ex:
+                live, error = None, str(ex)
+
+            async def show():
+                if error:
+                    self._toast(f"Could not check Shopify product: {error}")
+                    return
+                self._show_shopify_product_dialog(path, project, live)
+
+            try:
+                self.page.run_task(show)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_shopify_product_dialog(self, path: Path, project: Optional[Project],
+                                     live: Optional[dict]):
+        cfg = self.state.config
+        if live:
+            status = "publish" if live.get("status") == "ACTIVE" else "draft"
+        else:
+            try:
+                raw = str(frontmatter.load(str(path)).metadata.get("publish", "draft")).lower()
+                status = "publish" if raw in {"publish", "published", "live", "true"} else "draft"
+            except Exception:
+                status = "draft"
+        project_name = project.name if project else ""
+        try:
+            _payload, preview, _id = shopify_products.build_product(
+                path, shopify_products.ProductOptions(
+                    status=status, project_tag=project_name,
+                    tag_exclude=[t.strip() for t in cfg.publish_tag_exclude.split(",")]))
+        except shopify_publish.ShopifyPublishError as ex:
+            self._toast(str(ex))
+            return
+        status_dd = ft.Dropdown(
+            label="Product status", value=status,
+            options=[ft.dropdown.Option(key="draft", text="Draft"),
+                     ft.dropdown.Option(key="publish", text="Live on site — contact only")])
+
+        def go(_e):
+            self.page.pop_dialog()
+            options = shopify_products.ProductOptions(
+                status=status_dd.value or "draft", project_tag=project_name,
+                tag_exclude=[t.strip() for t in cfg.publish_tag_exclude.split(",")])
+            self._do_publish_shopify_product(path, options)
+
+        self.page.show_dialog(ft.AlertDialog(
+            title=ft.Text("Update Shopify product" if live else "Create Shopify product"),
+            content=ft.Container(width=480, content=ft.Column([
+                ft.Text(f"{preview.title} → {cfg.shopify_store}", size=13),
+                ft.Text(f"USD ${preview.price} placeholder · contact-first listing",
+                        size=11, color=ft.Colors.OUTLINE),
+                ft.Text(f"Tags: {', '.join(preview.tags) if preview.tags else 'none'}",
+                        size=11, italic=True, color=ft.Colors.OUTLINE),
+                status_dd,
+                ft.Text("Live products display with a disabled purchase button. "
+                        "Price and description come from the Markdown note.",
+                        size=11, color=ft.Colors.OUTLINE),
+            ], tight=True, spacing=8)),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _e: self.page.pop_dialog()),
+                ft.FilledButton("Update" if live else "Create", icon=ft.Icons.PUBLIC,
+                                on_click=go),
+            ]))
+
+    def _do_publish_shopify_product(self, path: Path,
+                                    options: "shopify_products.ProductOptions"):
+        creds = shopify_publish.creds_from_config(self.state.config)
+        self._toast("Sending product to Shopify…")
+
+        def run():
+            try:
+                result = shopify_products.publish_product(creds, path, options=options)
+                msg = f"{result.action} product ({result.status}): {result.title}"
+                url = result.url if result.status == "publish" else ""
+            except shopify_publish.ShopifyPublishError as ex:
+                msg, url = f"Shopify product publish failed: {ex}", ""
+            except Exception as ex:
+                msg, url = f"Shopify product publish error: {ex}", ""
 
             async def finish():
                 self._toast(msg, url=url or None)
@@ -3627,14 +3777,19 @@ class WorkbenchApp:
             ]
             if publishable:
                 pub, _purl = self._note_publish_state(Path(n.path))
-                provider = ("Shopify" if getattr(self.state.config, "publishing_provider", "shopify")
-                            == "shopify" else "WordPress")
+                if n.note_type == "product":
+                    destination = "Shopify product"
+                else:
+                    provider = ("Shopify" if getattr(self.state.config,
+                                                     "publishing_provider", "shopify")
+                                == "shopify" else "WordPress")
+                    destination = f"{provider} article"
                 hdr_controls.append(ft.IconButton(
                     icon=ft.Icons.CLOUD_DONE_OUTLINED if pub else ft.Icons.PUBLIC,
                     icon_size=16,
                     icon_color=ft.Colors.PRIMARY if pub else ft.Colors.OUTLINE,
-                    tooltip=(f"Update article on {provider}" if pub else
-                             f"Create article on {provider}"),
+                    tooltip=(f"Update {destination}" if pub else
+                             f"Create {destination}"),
                     on_click=lambda e, pth=Path(n.path), pr=project:
                         self._on_publish_note(pth, pr),
                 ))
@@ -6171,15 +6326,16 @@ class WorkbenchApp:
                         self.settings_provider_dd,
                         self.settings_wp_agent_switch,
                         ft.Text("Off by default. When enabled, the chat agent can push a "
-                                "draft or live post to the selected destination; it also "
+                                "draft or live post or product; it also "
                                 "obeys ‘Ask before changes’.",
                                 size=11, color=ft.Colors.OUTLINE),
-                        ft.Text("SHOPIFY BLOG", size=10,
+                        ft.Text("SHOPIFY BLOG + PRODUCTS", size=10,
                                 weight=ft.FontWeight.BOLD, color=ft.Colors.OUTLINE),
                         ft.Text("One blog for every project. Create a Shopify Dev Dashboard "
-                                "app with write_content access in the store's organization, "
+                                "app with write_content plus product, inventory, and "
+                                "publication read/write access in the store's organization, "
                                 "then enter its Client ID and secret. An existing installed "
-                                "app's Admin API token also works. Posts start as drafts; "
+                                "app's Admin API token also works. Notes start as drafts; "
                                 "send optional emails later in Shopify Messaging.",
                                 size=11, color=ft.Colors.OUTLINE),
                         self.settings_shopify_store_field,
@@ -6462,7 +6618,7 @@ class WorkbenchApp:
             self._toast(f"Move failed: {err}")
             return
         self.refresh()
-        self._toast(f"{p.name} → its own folder. You can now add posts/journals/notes.")
+        self._toast(f"{p.name} → its own folder. You can now add posts/products/notes.")
 
     def _on_add_task(self, pid: str, src):
         """Append `- [ ] <text>` to the project's main note under `## Tasks`

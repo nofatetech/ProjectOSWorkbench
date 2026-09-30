@@ -82,6 +82,11 @@ class ShopifyPublishTests(unittest.TestCase):
         with self.assertRaisesRegex(shopify.ShopifyPublishError, "public"):
             shopify.build_article(self.note, BLOG, "Owner")
 
+    def test_product_note_cannot_be_sent_as_blog_article(self):
+        self.note.write_text(self.note.read_text().replace("type: post", "type: product"))
+        with self.assertRaisesRegex(shopify.ShopifyPublishError, "product publisher"):
+            shopify.build_article(self.note, BLOG, "Owner")
+
     def test_update_refuses_article_from_another_blog(self):
         self.note.write_text(self.note.read_text().replace(
             "type: post", f"type: post\nshopify_article_id: {ARTICLE}"))

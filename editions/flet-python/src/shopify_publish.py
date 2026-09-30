@@ -189,6 +189,10 @@ def build_article(path: Path, blog_id: str, author: str,
     opts = options or ShopifyOptions()
     post = frontmatter.load(str(path))
     meta, body = post.metadata, post.content or ""
+    if str(meta.get("type") or "").strip().lower() == "product":
+        raise ShopifyPublishError("Use the Shopify product publisher for `type: product` notes.")
+    if meta.get("shopify_product_id"):
+        raise ShopifyPublishError("This note is linked to a Shopify product, not a blog article.")
     title = str(meta.get("title") or "").strip()
     h1 = re.search(r"^#\s+(.+?)\s*$", body, re.M)
     if not title:

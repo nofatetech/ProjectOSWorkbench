@@ -172,18 +172,18 @@ DELEGATE_SCHEMAS = [
             "required": ["job_id"]}}},
 ]
 
-# Advertised only when publishing is enabled (see schemas_for). Publishes a note
-# to WordPress.com via the app's vault-aware policy. Category/tags are derived
-# automatically from the note's project/area — the agent doesn't set them; it just
-# names the note (and optionally status/visibility).
+# Advertised only when publishing is enabled (see schemas_for). `type: product`
+# notes go to Shopify products; post/journal notes use the selected blog provider.
+# Tags are derived from the note and project.
 PUBLISH_SCHEMAS = [
     {"type": "function", "function": {
         "name": "publish_note",
         "description": (
-            "Publish (or update) a vault note to the configured blog destination. Draft-first. "
-            "Re-publishing the same note UPDATES its existing post (no duplicate). "
+            "Publish (or update) a vault note. Product notes become Shopify products; "
+            "post/journal notes use the configured blog. Draft-first. "
+            "Re-publishing the same note UPDATES its existing remote item. "
             "Tags are set automatically from the note's project — do not pass them. "
-            "Returns the post URL on success."),
+            "Returns the URL on success."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
                      "description": "note path (vault-relative or absolute)"},

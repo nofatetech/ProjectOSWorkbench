@@ -78,7 +78,8 @@ Click **Settings** at the bottom of the sidebar:
 ### Shopify publishing MVP
 
 1. In the Shopify Dev Dashboard, create an app for `nofatetech.myshopify.com`
-   with `write_content` access and install it on the store. [Client credentials](https://shopify.dev/docs/apps/build/authentication-authorization/client-credentials-grant)
+   with `write_content`, product and inventory read/write, and publication
+   read/write access and install it on the store. [Client credentials](https://shopify.dev/docs/apps/build/authentication-authorization/client-credentials-grant)
    work when the app and store belong to the same Shopify organization. For an
    app installed through another authorization path, use its Admin API access
    token instead. Keep all secrets in Workbench Settings, never in vault notes.
@@ -103,6 +104,39 @@ Click **Settings** at the bottom of the sidebar:
    [Shopify Forms](https://help.shopify.com/en/manual/promoting-marketing/create-marketing/forms-app/settings/all-forms)
    or the theme's newsletter section, with email marketing consent enabled.
    Subscriber segments and welcome emails can then be managed in Shopify.
+
+The same project card also supports **+ new product**. A `type: product` note
+uses the same Shopify connection regardless of the selected blog provider. Its
+publish button creates or updates one Shopify product; the note receives
+`shopify_product_id` and `shopify_published_url`. New products start as drafts.
+Choose **Live on site — contact only** to list the offer in the Online Store.
+Workbench uses a single variant at zero tracked inventory, prevents overselling,
+and makes shipping unnecessary. The normal Shopify purchase button is disabled;
+visitors use the contact link in the product description. A direct Ajax cart
+request may still add the variant, so this is a lead-first storefront convention,
+not a custom checkout validation rule. Keep payment terms out of the $1 listing.
+
+Example product note:
+
+```markdown
+---
+type: product
+publish: draft
+price_usd: 1.00
+tags: [consulting, systems]
+---
+
+# Systems Diagnosis
+
+Describe who this helps, the scope, and the next step.
+```
+
+`price_usd` defaults to `1.00` and is a catalog placeholder, not an agreed fee.
+To update an existing Shopify product from Markdown, set its exact
+`shopify_product_id` in frontmatter; Workbench will reject products with multiple
+variants or nonzero inventory. A product note marked private or subscriber-only
+cannot go live. Product images remain managed in Shopify and are
+preserved during text/price updates. Local Markdown images are not uploaded.
 
 Example note:
 
@@ -278,7 +312,8 @@ conversation is a `parent_id` tree (branches, pins, regenerate).
 | `tools.py` | the agent's tool registry + execution + CLI delegation |
 | `vault.py` | read/write/scan layer over the vault |
 | `publish.py` | WordPress.com publishing (existing destination) |
-| `shopify_publish.py` | Shopify blog publishing (GraphQL Admin API, frontmatter writeback) |
+| `shopify_publish.py` | Shopify blog publishing and shared API connection |
+| `shopify_products.py` | Contact-first Shopify product publishing and frontmatter writeback |
 | `views/people.py` | the People directory view |
 | `store.py` | thread persistence (JSON) |
 | `config.py` | `~/.workbench/config.json` + title-theme presets |

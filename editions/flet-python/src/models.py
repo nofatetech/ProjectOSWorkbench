@@ -137,7 +137,7 @@ class ProjectContent:
     """Everything in a project's folder, classified by content type."""
     tasks: list[Task] = field(default_factory=list)
     inbox: list[Note] = field(default_factory=list)   # notes in <project>/Inbox/
-    posts: list[Note] = field(default_factory=list)   # notes typed post/journal
+    posts: list[Note] = field(default_factory=list)   # notes typed post/journal/product
     wiki: list[Note] = field(default_factory=list)    # other notes (reference)
     files: list[FileItem] = field(default_factory=list)  # non-markdown
 

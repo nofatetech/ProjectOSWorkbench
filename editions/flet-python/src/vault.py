@@ -390,7 +390,12 @@ def create_project_note(folder: Path, note_type: str, title: str) -> Path:
     while path.exists():
         path = folder / f"{slug}-{n}.md"
         n += 1
-    path.write_text(f"---\ntype: {note_type}\n---\n\n# {title}\n", encoding="utf-8")
+    if note_type == "product":
+        text = (f"---\ntype: product\npublish: draft\nprice_usd: 1.00\n---\n\n"
+                f"# {title}\n\n")
+    else:
+        text = f"---\ntype: {note_type}\n---\n\n# {title}\n"
+    path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -660,7 +665,7 @@ def scan_project_content(project: Project, vault_root: Path) -> ProjectContent:
             name=entry.stem, path=str(entry),
             note_type=ntype, summary=_first_body_line(post),
         )
-        if ntype in ("post", "journal"):
+        if ntype in ("post", "journal", "product"):
             pc.posts.append(note)
         else:
             pc.wiki.append(note)
