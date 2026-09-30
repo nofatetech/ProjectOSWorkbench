@@ -116,6 +116,17 @@ class Config:
     # an outward-facing action (posts to the web), so it's opt-in like delegation.
     # Still draft-first; obeys the same tool-confirm gate as other mutating tools.
     publish_enabled: bool = False
+    # --- Shopify blog publishing ---
+    # One blog for posts from every project. Use a Dev Dashboard app in the same
+    # Shopify organization (client credentials grant), or an existing installed
+    # app's Admin API access token. Secrets stay in this chmod-600 config file.
+    publishing_provider: str = "shopify"  # shopify | wordpress
+    shopify_store: str = "nofatetech.myshopify.com"
+    shopify_client_id: str = ""
+    shopify_client_secret: str = ""
+    shopify_access_token: str = ""
+    shopify_blog_id: str = ""
+    shopify_author: str = ""
     # Git TUI launched by the "Open in lazygit" buttons (vault on Home + each
     # project's working_dir card). It's a terminal app, so it rides the same
     # interactive terminal template above ({dir}/{cmd}). Swap for gitui/tig/etc.
@@ -163,6 +174,9 @@ def load_config() -> Config:
         return Config()
     try:
         data = json.loads(CONFIG_PATH.read_text())
+        if "publishing_provider" not in data and data.get("wpcom_site"):
+            # Existing installs with WordPress configured retain their destination.
+            data["publishing_provider"] = "wordpress"
         known = {k: v for k, v in data.items()
                  if k in {f.name for f in dataclasses.fields(Config)}}
         return Config(**known)

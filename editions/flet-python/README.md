@@ -75,6 +75,56 @@ Click **Settings** at the bottom of the sidebar:
 3. Pick a **chat model** (any OpenRouter slug, or an `ollama/...` one).
 4. Save — writes `~/.workbench/config.json` (chmod 600).
 
+### Shopify publishing MVP
+
+1. In the Shopify Dev Dashboard, create an app for `nofatetech.myshopify.com`
+   with `write_content` access and install it on the store. [Client credentials](https://shopify.dev/docs/apps/build/authentication-authorization/client-credentials-grant)
+   work when the app and store belong to the same Shopify organization. For an
+   app installed through another authorization path, use its Admin API access
+   token instead. Keep all secrets in Workbench Settings, never in vault notes.
+2. In **Settings → PUBLISHING**, choose **Shopify blog**, enter the store domain
+   and app credentials, then click **Connect and load blogs**. Choose one blog,
+   enter the Shopify author name, and save. Shopify stores have a default `News`
+   blog; you can rename it in **Content → Blog posts → Manage blogs**.
+   If connection reports `app_not_installed`, releasing the app version was not
+   enough: use the Dev Dashboard app's **Installs → Install app** action for this
+   exact store, or its custom distribution install link.
+3. Create a project post or journal note, write it in Obsidian, then use the
+   cloud/publish button beside it in Workbench. Choose **Draft** or **Live on
+   site**. All projects publish to the same selected blog. The note gets
+   `shopify_article_id`, `shopify_blog_id`, `shopify_store`, and its URL after a
+   successful push. Pushing again updates that article.
+4. To email it, use **Open Shopify for optional email** from the posts card,
+   then open **Apps → Messaging**. Shopify Messaging is a separate campaign
+   editor: compose the email, insert the article link or excerpt, select a
+   customer segment, and send or schedule it there. Publishing a blog article
+   alone does not send email.
+5. To grow the list, add a newsletter signup to the storefront with
+   [Shopify Forms](https://help.shopify.com/en/manual/promoting-marketing/create-marketing/forms-app/settings/all-forms)
+   or the theme's newsletter section, with email marketing consent enabled.
+   Subscriber segments and welcome emails can then be managed in Shopify.
+
+Example note:
+
+```markdown
+---
+type: post
+title: A small update
+publish: draft
+tags: [field-notes]
+summary: A short preview for the blog listing.
+---
+
+The post body is ordinary Markdown.
+```
+
+This MVP does not make blog articles subscriber-only or create Shopify Messaging
+campaigns through an API. A **live** Shopify blog article is public; use draft
+status while preparing member-only material. Workbench refuses to make a note
+live if its `audience:` or `visibility:` is marked `subscribers`, `members`,
+`paid`, or `private`. Obsidian `[[wikilinks]]` become plain text, and local
+image paths are not uploaded to Shopify.
+
 ### Model routing
 
 The model string's prefix decides where a call goes:
@@ -136,15 +186,12 @@ accepts any Material icon name (`smart_toy`, `face`, `psychology`, …).
   grid that seeds weekly-review threads.
 - **Demand probes.** `active` projects tagged `demand-probe` get their own Home
   section, sorted stalest-first. (See `docs/vault-conventions.md`.)
-- **Publish to the web.** A button on a project's posts/journals publishes a note
-  to WordPress.com (REST v1.1, draft-first). The result is written back into the
-  note's own frontmatter (`wp_post_id` / `published_url`), so re-publishing
-  *updates* the same post instead of duplicating it. Categories/tags are derived
-  from the note's place in the vault (category = `area`, tags = project + the
-  note's `tags:`, minus a never-public exclude list); per-publish visibility
-  (public / private / password) and frontmatter overrides
-  (`visibility` / `wp_password` / `wp_categories` / `wp_tags`). Configure under
-  **Settings → PUBLISHING** (with a "Test connection" button).
+- **Publish to the web.** A button on each project's posts/journals creates or
+  updates an article in one Shopify blog. The Markdown note stays the source;
+  Shopify's article ID and URL are written back to frontmatter so the next push
+  updates the same article. Choose draft or live for each push. Project and note
+  tags organize posts within that one blog. WordPress.com remains a selectable
+  destination for notes already using it.
 - **Themeable.** Light "Platinum" surface theme + configurable title styles.
 
 ## Tools
@@ -159,7 +206,7 @@ When tools are enabled (default), the agent can call:
 | `list_dir` | list a folder |
 | `run_shell` | run a shell command in the project's `working_dir` |
 | `delegate_to_claude_code` | (opt-in) run a headless CLI agent and poll for the result |
-| `publish_note` | (opt-in) publish/update a note on WordPress.com (draft-first; auto category/tags) |
+| `publish_note` | (opt-in) publish/update a note at the configured blog destination |
 
 Toggle them off in **Settings → Enable tools** for a read-only chat. `publish_note`
 is off by default — turn it on under **Settings → PUBLISHING** ("Let the chat
@@ -230,7 +277,8 @@ conversation is a `parent_id` tree (branches, pins, regenerate).
 | `brain.py` | model routing + streaming (Mock / OpenRouter / Ollama) + tool-call parsing |
 | `tools.py` | the agent's tool registry + execution + CLI delegation |
 | `vault.py` | read/write/scan layer over the vault |
-| `publish.py` | publish a note to WordPress.com (REST v1.1, draft-first, frontmatter writeback) |
+| `publish.py` | WordPress.com publishing (existing destination) |
+| `shopify_publish.py` | Shopify blog publishing (GraphQL Admin API, frontmatter writeback) |
 | `views/people.py` | the People directory view |
 | `store.py` | thread persistence (JSON) |
 | `config.py` | `~/.workbench/config.json` + title-theme presets |

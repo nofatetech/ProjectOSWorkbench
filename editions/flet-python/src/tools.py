@@ -180,19 +180,19 @@ PUBLISH_SCHEMAS = [
     {"type": "function", "function": {
         "name": "publish_note",
         "description": (
-            "Publish (or update) a vault note as a WordPress.com post. Draft-first. "
+            "Publish (or update) a vault note to the configured blog destination. Draft-first. "
             "Re-publishing the same note UPDATES its existing post (no duplicate). "
-            "Categories/tags are set automatically from the note's project & area — "
-            "do not pass them. Returns the live post URL on success."),
+            "Tags are set automatically from the note's project — do not pass them. "
+            "Returns the post URL on success."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
                      "description": "note path (vault-relative or absolute)"},
             "status": {"type": "string", "enum": ["draft", "publish"],
                        "description": "optional; defaults to the configured default (draft)"},
             "visibility": {"type": "string", "enum": ["public", "private", "password"],
-                           "description": "optional post visibility"},
+                           "description": "WordPress only: optional post visibility"},
             "password": {"type": "string",
-                         "description": "optional; required only when visibility=password"}},
+                         "description": "WordPress only: required when visibility=password"}},
             "required": ["path"]}}},
 ]
 

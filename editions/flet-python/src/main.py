@@ -37,6 +37,7 @@ from config import (CONFIG_PATH, load_config, save_config,
 from store import save_thread, load_thread_dicts
 from tools import ToolContext, execute_tool, schemas_for, MUTATING_TOOLS
 import publish
+import shopify_publish
 from models import (Agent, Turn, Thread, Area, Project, Task, Note, FileItem,
                     InboxItem, VaultEntry, OpenTab)
 from theme import (STATUS_COLORS, PLATINUM, _all_border, _bevel, _raised, _recessed, _sticky)
@@ -295,9 +296,9 @@ def build_messages_for_general_agent(
         if publish_available:
             parts.append(
                 "\nTo publish a note to the web, call publish_note(path) — it posts "
-                "to WordPress.com (draft-first; re-publishing updates the same post). "
-                "Categories and tags are set automatically from the note's project & "
-                "area, so do NOT pass them. Optional: status (draft/publish), "
+                "to the configured blog destination (draft-first; re-publishing "
+                "updates the same post). Tags are derived from the note's project. "
+                "Optional: status (draft/publish). WordPress also supports "
                 "visibility (public/private/password)."
             )
 
@@ -1362,7 +1363,33 @@ class WorkbenchApp:
             label="CLI session command ('Open CLI session' button)",
             value=cfg.cli_session_command,
         )
-        # --- Publishing (WordPress.com) ---
+        # --- Publishing ---
+        self.settings_provider_dd = ft.Dropdown(
+            label="Post destination",
+            value=getattr(cfg, "publishing_provider", "shopify") or "shopify",
+            options=[ft.dropdown.Option(key="shopify", text="Shopify blog"),
+                     ft.dropdown.Option(key="wordpress", text="WordPress.com")])
+        self.settings_shopify_store_field = ft.TextField(
+            label="Shopify store", value=getattr(cfg, "shopify_store", ""),
+            hint_text="nofatetech.myshopify.com")
+        self.settings_shopify_clientid_field = ft.TextField(
+            label="App Client ID", value=getattr(cfg, "shopify_client_id", ""))
+        self.settings_shopify_secret_field = ft.TextField(
+            label="App Client Secret", value=getattr(cfg, "shopify_client_secret", ""),
+            password=True, can_reveal_password=True)
+        self.settings_shopify_token_field = ft.TextField(
+            label="Existing Admin API token (alternative)",
+            value=getattr(cfg, "shopify_access_token", ""),
+            password=True, can_reveal_password=True)
+        saved_blog = getattr(cfg, "shopify_blog_id", "") or ""
+        self.settings_shopify_blog_dd = ft.Dropdown(
+            label="Blog", value=saved_blog or None,
+            options=[ft.dropdown.Option(key=saved_blog, text=saved_blog)] if saved_blog else [])
+        self.settings_shopify_author_field = ft.TextField(
+            label="Article author (Shopify store owner or staff name)",
+            value=getattr(cfg, "shopify_author", ""))
+        self.settings_shopify_test_status = ft.Text("", size=11, selectable=True)
+        # --- WordPress.com (legacy destination) ---
         self.settings_wp_site_field = ft.TextField(
             label="WordPress.com site", value=getattr(cfg, "wpcom_site", ""),
             hint_text="myweb1712.wordpress.com")
@@ -3065,8 +3092,12 @@ class WorkbenchApp:
         label and the toast's Open action."""
         try:
             post = frontmatter.load(str(path))
-            pid = str(post.metadata.get("wp_post_id") or "").strip()
-            url = str(post.metadata.get("published_url") or "").strip()
+            if getattr(self.state.config, "publishing_provider", "shopify") == "shopify":
+                pid = str(post.metadata.get("shopify_article_id") or "").strip()
+                url = str(post.metadata.get("shopify_published_url") or "").strip()
+            else:
+                pid = str(post.metadata.get("wp_post_id") or "").strip()
+                url = str(post.metadata.get("published_url") or "").strip()
             return bool(pid), url
         except Exception:
             return False, ""
@@ -3128,6 +3159,34 @@ class WorkbenchApp:
         if not path.is_file():
             return f"[publish_note: note not found: {path}]"
         cfg = self.state.config
+        if getattr(cfg, "publishing_provider", "shopify") == "shopify":
+            if args.get("visibility") or args.get("password"):
+                return "[publish_note: subscriber visibility is not configured for Shopify]"
+            shopify_creds = shopify_publish.creds_from_config(cfg)
+            project = self._project_for_path(path)
+            options = shopify_publish.ShopifyOptions(
+                default_status="draft",
+                project_tag=project.name if project else "",
+                tag_exclude=[t.strip() for t in cfg.publish_tag_exclude.split(",")])
+            try:
+                shopify_creds.validate()
+                if args.get("status"):
+                    options.status = str(args["status"])
+                else:
+                    article_id = str(frontmatter.load(str(path)).metadata.get(
+                        "shopify_article_id") or "").strip()
+                    if article_id:
+                        live = shopify_publish.get_article(shopify_creds, article_id)
+                        options.status = "publish" if live.get("isPublished") else "draft"
+                shopify_res = shopify_publish.publish_note(
+                    shopify_creds, path, blog_id=cfg.shopify_blog_id,
+                    author=cfg.shopify_author, options=options)
+            except shopify_publish.ShopifyPublishError as ex:
+                return f"[publish_note failed: {ex}]"
+            except Exception as ex:
+                return f"[publish_note error: {ex}]"
+            return (f"{shopify_res.action} ({shopify_res.status}): "
+                    f"{shopify_res.title} · url={shopify_res.url}")
         creds = publish.creds_from_config(cfg)
         try:
             creds.validate()
@@ -3181,6 +3240,9 @@ class WorkbenchApp:
         stops an update from silently downgrading a live/password-protected post to
         draft."""
         cfg = self.state.config
+        if getattr(cfg, "publishing_provider", "shopify") == "shopify":
+            self._on_publish_shopify_note(path, project)
+            return
         try:
             publish.creds_from_config(cfg).validate()
         except publish.PublishError as ex:
@@ -3205,6 +3267,126 @@ class WorkbenchApp:
 
             try:
                 self.page.run_task(_show)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_publish_shopify_note(self, path: Path, project: Optional[Project] = None):
+        cfg = self.state.config
+        creds = shopify_publish.creds_from_config(cfg)
+        try:
+            creds.validate()
+        except shopify_publish.ShopifyPublishError as ex:
+            self._toast(str(ex))
+            return
+        project = project or self._project_for_path(path)
+        try:
+            article_id = str(frontmatter.load(str(path)).metadata.get(
+                "shopify_article_id") or "").strip()
+        except Exception as ex:
+            self._toast(f"Could not read note: {ex}")
+            return
+        if not article_id:
+            self._show_shopify_publish_dialog(path, project, None)
+            return
+        self._toast("Checking Shopify article…")
+
+        def run():
+            try:
+                live = shopify_publish.get_article(creds, article_id)
+                error = ""
+            except shopify_publish.ShopifyPublishError as ex:
+                live, error = None, str(ex)
+
+            async def show():
+                if error:
+                    self._toast(f"Could not check Shopify status: {error}")
+                    return
+                self._show_shopify_publish_dialog(path, project, live)
+
+            try:
+                self.page.run_task(show)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _show_shopify_publish_dialog(self, path: Path, project: Optional[Project],
+                                     live: Optional[dict]):
+        cfg = self.state.config
+        if live:
+            status = "publish" if live.get("isPublished") else "draft"
+        else:
+            try:
+                meta = frontmatter.load(str(path)).metadata
+                raw = str(meta.get("publish", "draft")).lower()
+                status = "publish" if raw in {"publish", "published", "live", "true"} else "draft"
+            except Exception:
+                status = "draft"
+        status_dd = ft.Dropdown(
+            label="Article status", value=status,
+            options=[ft.dropdown.Option(key="draft", text="Draft"),
+                     ft.dropdown.Option(key="publish", text="Live on site")])
+        existing = bool(live)
+        project_name = project.name if project else ""
+        tags = []
+        try:
+            _payload, preview, _id = shopify_publish.build_article(
+                path, cfg.shopify_blog_id, cfg.shopify_author,
+                shopify_publish.ShopifyOptions(status="draft", project_tag=project_name,
+                    tag_exclude=[t.strip() for t in cfg.publish_tag_exclude.split(",")]))
+            tags = preview.tags
+        except shopify_publish.ShopifyPublishError as ex:
+            self._toast(str(ex))
+            return
+
+        def go(_e):
+            self.page.pop_dialog()
+            options = shopify_publish.ShopifyOptions(
+                status=status_dd.value or "draft", project_tag=project_name,
+                tag_exclude=[t.strip() for t in cfg.publish_tag_exclude.split(",")])
+            self._do_publish_shopify_note(path, options)
+
+        self.page.show_dialog(ft.AlertDialog(
+            title=ft.Text("Update Shopify article" if existing else "Create Shopify article"),
+            content=ft.Container(width=480, content=ft.Column([
+                ft.Text(f"{path.stem} → {cfg.shopify_store}", size=13),
+                ft.Text(f"Tags: {', '.join(tags) if tags else 'none'}", size=11,
+                        italic=True, color=ft.Colors.OUTLINE),
+                status_dd,
+                ft.Text("Email is optional: send separately from Shopify Apps → Messaging.",
+                        size=11, color=ft.Colors.OUTLINE),
+            ], tight=True, spacing=8)),
+            actions=[
+                ft.TextButton("Cancel", on_click=lambda _e: self.page.pop_dialog()),
+                ft.FilledButton("Update" if existing else "Create", icon=ft.Icons.PUBLIC,
+                                on_click=go),
+            ]))
+
+    def _do_publish_shopify_note(self, path: Path, options: "shopify_publish.ShopifyOptions"):
+        cfg = self.state.config
+        creds = shopify_publish.creds_from_config(cfg)
+        self._toast("Sending article to Shopify…")
+
+        def run():
+            try:
+                result = shopify_publish.publish_note(
+                    creds, path, blog_id=cfg.shopify_blog_id,
+                    author=cfg.shopify_author, options=options)
+                msg = f"{result.action} ({result.status}): {result.title}"
+                url = result.url if result.status == "publish" else ""
+            except shopify_publish.ShopifyPublishError as ex:
+                msg, url = f"Shopify publish failed: {ex}", ""
+            except Exception as ex:
+                msg, url = f"Shopify publish error: {ex}", ""
+
+            async def finish():
+                self._toast(msg, url=url or None)
+                self.refresh()
+
+            try:
+                self.page.run_task(finish)
             except Exception:
                 pass
 
@@ -3434,7 +3616,7 @@ class WorkbenchApp:
         items: list[ft.Control] = [
             ft.Text(caption, size=11, italic=True, color=ft.Colors.OUTLINE),
         ]
-        for n in notes[:5]:
+        for n in (notes if publishable else notes[:5]):
             hdr_controls: list[ft.Control] = [
                 ft.Icon(icon=ft.Icons.DESCRIPTION_OUTLINED,
                         size=14, color=ft.Colors.OUTLINE),
@@ -3445,12 +3627,14 @@ class WorkbenchApp:
             ]
             if publishable:
                 pub, _purl = self._note_publish_state(Path(n.path))
+                provider = ("Shopify" if getattr(self.state.config, "publishing_provider", "shopify")
+                            == "shopify" else "WordPress")
                 hdr_controls.append(ft.IconButton(
                     icon=ft.Icons.CLOUD_DONE_OUTLINED if pub else ft.Icons.PUBLIC,
                     icon_size=16,
                     icon_color=ft.Colors.PRIMARY if pub else ft.Colors.OUTLINE,
-                    tooltip=("Update published post on WordPress"
-                             if pub else "Publish to web (draft) on WordPress"),
+                    tooltip=(f"Update article on {provider}" if pub else
+                             f"Create article on {provider}"),
                     on_click=lambda e, pth=Path(n.path), pr=project:
                         self._on_publish_note(pth, pr),
                 ))
@@ -3475,7 +3659,7 @@ class WorkbenchApp:
                     ),
                 )
             )
-        if len(notes) > 5:
+        if len(notes) > 5 and not publishable:
             items.append(
                 ft.Text(f"+ {len(notes) - 5} more",
                         size=11, italic=True, color=ft.Colors.OUTLINE)
@@ -3494,6 +3678,12 @@ class WorkbenchApp:
                     spacing=4, wrap=True,
                 )
             )
+        if publishable and getattr(self.state.config, "publishing_provider", "shopify") == "shopify":
+            store = self.state.config.shopify_store
+            items.append(ft.TextButton(
+                "Open Shopify for optional email", icon=ft.Icons.OPEN_IN_NEW,
+                on_click=lambda _e: self.page.launch_url(
+                    f"https://{store}/admin")))
         return self._section_card(header, items)
 
     def _build_files_section_card(self, files: list[FileItem]) -> ft.Control:
@@ -5976,7 +6166,40 @@ class WorkbenchApp:
                                 "template above.",
                                 size=11, color=ft.Colors.OUTLINE),
                         ft.Container(height=8),
-                        ft.Text("PUBLISHING (WordPress.com)", size=10,
+                        ft.Text("PUBLISHING", size=10,
+                                weight=ft.FontWeight.BOLD, color=ft.Colors.OUTLINE),
+                        self.settings_provider_dd,
+                        self.settings_wp_agent_switch,
+                        ft.Text("Off by default. When enabled, the chat agent can push a "
+                                "draft or live post to the selected destination; it also "
+                                "obeys ‘Ask before changes’.",
+                                size=11, color=ft.Colors.OUTLINE),
+                        ft.Text("SHOPIFY BLOG", size=10,
+                                weight=ft.FontWeight.BOLD, color=ft.Colors.OUTLINE),
+                        ft.Text("One blog for every project. Create a Shopify Dev Dashboard "
+                                "app with write_content access in the store's organization, "
+                                "then enter its Client ID and secret. An existing installed "
+                                "app's Admin API token also works. Posts start as drafts; "
+                                "send optional emails later in Shopify Messaging.",
+                                size=11, color=ft.Colors.OUTLINE),
+                        self.settings_shopify_store_field,
+                        self.settings_shopify_clientid_field,
+                        self.settings_shopify_secret_field,
+                        self.settings_shopify_token_field,
+                        ft.Row([
+                            ft.OutlinedButton("Connect and load blogs",
+                                              icon=ft.Icons.WIFI_TETHERING,
+                                              on_click=self._on_test_shopify_connection),
+                            self.settings_shopify_test_status,
+                        ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                        self.settings_shopify_blog_dd,
+                        self.settings_shopify_author_field,
+                        ft.OutlinedButton("Open Shopify admin for email",
+                                          icon=ft.Icons.OPEN_IN_NEW,
+                                          on_click=lambda _e: self.page.launch_url(
+                                              f"https://{self.settings_shopify_store_field.value}/admin")),
+                        ft.Container(height=8),
+                        ft.Text("WORDPRESS.COM (EXISTING)", size=10,
                                 weight=ft.FontWeight.BOLD, color=ft.Colors.OUTLINE),
                         ft.Text("Publish a note as a WordPress.com post (draft-first). "
                                 "Auth uses a registered app's OAuth2 password grant — "
@@ -6004,11 +6227,6 @@ class WorkbenchApp:
                         self.settings_wp_projtag_switch,
                         self.settings_wp_notetags_switch,
                         self.settings_wp_tagexclude_field,
-                        self.settings_wp_agent_switch,
-                        ft.Text("Off by default (publishing is outward-facing). When "
-                                "on, the chat agent can call publish_note; it's still "
-                                "draft-first and obeys “Ask before changes”.",
-                                size=11, color=ft.Colors.OUTLINE),
                         ft.Container(height=8),
                         ft.Text("GENERATION", size=10, weight=ft.FontWeight.BOLD,
                                 color=ft.Colors.OUTLINE),
@@ -6622,7 +6840,15 @@ class WorkbenchApp:
         cfg.delegate_timeout = _num(self.settings_delegate_timeout_field, int, cfg.delegate_timeout, 1)
         cfg.delegate_terminal_command = (self.settings_delegate_term_field.value or "").strip()
         cfg.cli_session_command = (self.settings_cli_session_field.value or "claude").strip()
-        # Publishing (WordPress.com)
+        # Publishing
+        cfg.publishing_provider = (self.settings_provider_dd.value or "shopify").strip()
+        cfg.shopify_store = (self.settings_shopify_store_field.value or "").strip().lower()
+        cfg.shopify_client_id = (self.settings_shopify_clientid_field.value or "").strip()
+        cfg.shopify_client_secret = (self.settings_shopify_secret_field.value or "").strip()
+        cfg.shopify_access_token = (self.settings_shopify_token_field.value or "").strip()
+        cfg.shopify_blog_id = (self.settings_shopify_blog_dd.value or "").strip()
+        cfg.shopify_author = (self.settings_shopify_author_field.value or "").strip()
+        # WordPress.com
         cfg.wpcom_site = (self.settings_wp_site_field.value or "").strip()
         cfg.wpcom_client_id = (self.settings_wp_clientid_field.value or "").strip()
         cfg.wpcom_client_secret = (self.settings_wp_secret_field.value or "").strip()
@@ -6666,6 +6892,49 @@ class WorkbenchApp:
             self.settings_save_status.value = f"Save failed: {ex}"
             self.settings_save_status.color = ft.Colors.ERROR
         self.page.update()
+
+    def _on_test_shopify_connection(self, e):
+        creds = shopify_publish.ShopifyCreds(
+            store=(self.settings_shopify_store_field.value or "").strip().lower(),
+            client_id=(self.settings_shopify_clientid_field.value or "").strip(),
+            client_secret=(self.settings_shopify_secret_field.value or "").strip(),
+            access_token=(self.settings_shopify_token_field.value or "").strip())
+        self.settings_shopify_test_status.value = "Connecting…"
+        self.settings_shopify_test_status.color = ft.Colors.OUTLINE
+        self.page.update()
+
+        def run():
+            try:
+                blogs = shopify_publish.list_blogs(creds)
+                error = "" if blogs else "Connected, but this store has no blogs yet."
+            except shopify_publish.ShopifyPublishError as ex:
+                blogs, error = [], str(ex)
+            except Exception as ex:
+                blogs, error = [], f"Connection error: {ex}"
+
+            async def finish():
+                if blogs:
+                    selected = self.settings_shopify_blog_dd.value
+                    self.settings_shopify_blog_dd.options = [
+                        ft.dropdown.Option(key=b["id"], text=f"{b['title']} ({b['handle']})")
+                        for b in blogs]
+                    ids = {b["id"] for b in blogs}
+                    self.settings_shopify_blog_dd.value = (
+                        selected if selected in ids else blogs[0]["id"] if len(blogs) == 1 else None)
+                    self.settings_shopify_test_status.value = (
+                        f"Connected · {len(blogs)} blog(s). Choose an author and Save.")
+                    self.settings_shopify_test_status.color = ft.Colors.TERTIARY
+                else:
+                    self.settings_shopify_test_status.value = error
+                    self.settings_shopify_test_status.color = ft.Colors.ERROR
+                self.page.update()
+
+            try:
+                self.page.run_task(finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _on_test_wp_connection(self, e):
         """Mint a token from the fields as currently typed (no save needed) so you
