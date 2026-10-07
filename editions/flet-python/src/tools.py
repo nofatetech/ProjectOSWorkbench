@@ -41,6 +41,9 @@ class ToolContext:
     # the app while this module stays a thin executor. Signature mirrors a tool.
     publish_enabled: bool = False
     publish_fn: Optional[Callable[[dict], str]] = None
+    # Shopify store management (shopify_* tools). `shopify_fn(name, args) -> str`
+    # is supplied by the app with credentials bound; advertised only when set.
+    shopify_fn: Optional[Callable[[str, dict], str]] = None
 
 
 # --- Headless delegation: background job registry ---------------------------
@@ -197,12 +200,83 @@ PUBLISH_SCHEMAS = [
 ]
 
 
+SHOPIFY_SCHEMAS = [
+    {"type": "function", "function": {
+        "name": "shopify_query",
+        "description": (
+            "Run a READ-ONLY Shopify Admin GraphQL query (mutations are refused) against "
+            "the connected store: products, collections, pages, articles, orders, "
+            "customers, themes, menus, files, shop settings, shopifyqlQuery analytics. "
+            "Ask only for the fields you need; output is capped."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "GraphQL query document"},
+            "variables": {"type": "object", "description": "optional query variables"}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "shopify_status",
+        "description": (
+            "Compare vault notes linked to Shopify (shopify_product_id / _article_id / "
+            "_page_id) with the store: live/draft state, notes edited since their last "
+            "push, missing remote items, and store items no note is linked to."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "optional: check one note only"}}}}},
+    {"type": "function", "function": {
+        "name": "shopify_unpublish",
+        "description": (
+            "Take a linked note's item off the storefront without deleting it: product "
+            "→ draft (or archived), article/page → hidden. Updates the note's frontmatter."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "the linked note"},
+            "archive": {"type": "boolean", "description": "products only: archive instead of draft"}},
+            "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "shopify_upload_image",
+        "description": (
+            "Upload a local image. With product_note: attach it to that note's Shopify "
+            "product. Without: add it to the store's Files and return its CDN URL (to use "
+            "in page/article Markdown or theme settings)."),
+        "parameters": {"type": "object", "properties": {
+            "image": {"type": "string", "description": "image path (vault-relative or absolute)"},
+            "product_note": {"type": "string", "description": "optional: product note to attach to"},
+            "alt": {"type": "string", "description": "optional alt text"}},
+            "required": ["image"]}}},
+    {"type": "function", "function": {
+        "name": "shopify_theme_files",
+        "description": (
+            "List a theme's files (omit filenames) or read files' contents. Default theme "
+            "is the live one. Filenames accept wildcards, e.g. 'sections/*.liquid', "
+            "'templates/index.json', 'config/settings_data.json'."),
+        "parameters": {"type": "object", "properties": {
+            "theme_id": {"type": "string", "description": "optional theme ID (default: live theme)"},
+            "filenames": {"type": "array", "items": {"type": "string"}}}}}},
+    {"type": "function", "function": {
+        "name": "shopify_theme_write",
+        "description": (
+            "Create or overwrite one text file in a NON-live theme (the live theme is "
+            "refused). Workflow: shopify_theme_duplicate the live theme, edit the copy, "
+            "give the user the preview URL; they publish it in Shopify admin."),
+        "parameters": {"type": "object", "properties": {
+            "theme_id": {"type": "string"},
+            "filename": {"type": "string", "description": "e.g. sections/hero.liquid"},
+            "content": {"type": "string", "description": "the full new file content"}},
+            "required": ["theme_id", "filename", "content"]}}},
+    {"type": "function", "function": {
+        "name": "shopify_theme_duplicate",
+        "description": "Copy a theme (default: the live one) as a new unpublished theme to edit safely.",
+        "parameters": {"type": "object", "properties": {
+            "theme_id": {"type": "string", "description": "optional source theme (default: live)"},
+            "name": {"type": "string", "description": "optional name for the copy"}}}}},
+]
+SHOPIFY_TOOLS = {s["function"]["name"] for s in SHOPIFY_SCHEMAS}
+
+
 # Tools that change state on disk / spawn processes. The optional confirm dialog
 # (Config.tool_confirm) gates only these; read_vault_note / list_dir are
 # read-only and never prompted. execute_tool itself is unguarded — the gate lives
 # in the dispatch loop, which owns the UI, so this module stays UI-free.
 MUTATING_TOOLS = {"write_vault_note", "move_note", "run_shell",
-                  "delegate_to_claude_code", "publish_note"}
+                  "delegate_to_claude_code", "publish_note", "shopify_unpublish",
+                  "shopify_upload_image", "shopify_theme_write", "shopify_theme_duplicate"}
 
 
 def schemas_for(ctx: ToolContext) -> list:
@@ -213,6 +287,8 @@ def schemas_for(ctx: ToolContext) -> list:
         schemas += DELEGATE_SCHEMAS
     if ctx.publish_enabled:
         schemas += PUBLISH_SCHEMAS
+    if ctx.shopify_fn is not None:
+        schemas += SHOPIFY_SCHEMAS
     return schemas
 
 
@@ -270,6 +346,11 @@ def execute_tool(name: str, args: dict, ctx: ToolContext) -> str:
             if ctx.publish_fn is None:
                 return "[publish_note unavailable in this context]"
             return ctx.publish_fn(args)
+
+        if name in SHOPIFY_TOOLS:
+            if ctx.shopify_fn is None:
+                return "[Shopify tools are unavailable — enable publishing and connect Shopify in Settings]"
+            return ctx.shopify_fn(name, args)
 
         if name == "check_delegation":
             with _JOBS_LOCK:

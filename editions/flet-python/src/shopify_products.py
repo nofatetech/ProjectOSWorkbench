@@ -64,6 +64,15 @@ _PUBLISH = """mutation($id: ID!, $input: [PublicationInput!]!) {
     userErrors { field message }
   }
 }"""
+_COLLECTION_BY_HANDLE = """query($handle: String!) {
+  collectionByIdentifier(identifier: {handle: $handle}) { id title }
+}"""
+_COLLECTION_CREATE = """mutation($collection: CollectionCreateInput!) {
+  collectionCreate(collection: $collection) {
+    collection { id handle }
+    userErrors { field message }
+  }
+}"""
 _FINAL = """query($id: ID!, $publicationId: ID!) {
   product(id: $id) {
     id handle status publishedOnPublication(publicationId: $publicationId)
@@ -87,6 +96,7 @@ class ProductResult:
     url: str = ""
     product_id: str = ""
     tags: list[str] = field(default_factory=list)
+    collections: list[str] = field(default_factory=list)
 
 
 def _checked(creds: ShopifyCreds, operation: str, query: str, variables: dict) -> dict:
@@ -170,6 +180,13 @@ def build_product(path: Path, options: Optional[ProductOptions] = None
                "productType": str(meta.get("product_type") or "Service").strip(),
                "vendor": str(meta.get("vendor") or "NoFate Technology").strip(),
                "tags": tags}
+    handle = str(meta.get("handle") or "").strip()
+    if handle:
+        payload["handle"] = handle
+    seo = {k: str(meta[f"seo_{k}"]).strip() for k in ("title", "description")
+           if str(meta.get(f"seo_{k}") or "").strip()}
+    if seo:
+        payload["seo"] = seo
     product_id = str(meta.get("shopify_product_id") or "").strip()
     if product_id and not re.fullmatch(r"gid://shopify/Product/\d+", product_id):
         raise ShopifyPublishError("shopify_product_id must be a Shopify Product GID.")
@@ -185,6 +202,29 @@ def _publication_id(creds: ShopifyCreds) -> str:
     if len(matches) != 1:
         raise ShopifyPublishError("Could not find one Online Store publication in Shopify.")
     return matches[0]
+
+
+def _handleize(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.casefold()).strip("-") or "collection"
+
+
+def _ensure_collection(creds: ShopifyCreds, title: str, publication_id: str) -> str:
+    """ID of the manual collection with this title's handle, creating and
+    publishing it to the Online Store if missing. Join-only: a product is never
+    removed from collections the note no longer lists."""
+    handle = _handleize(title)
+    found = _graphql(creds, _COLLECTION_BY_HANDLE, {"handle": handle}).get(
+        "collectionByIdentifier") or {}
+    if found.get("id"):
+        return found["id"]
+    created = _checked(creds, "collectionCreate", _COLLECTION_CREATE,
+                       {"collection": {"title": title, "handle": handle}})
+    collection_id = (created.get("collection") or {}).get("id") or ""
+    if not collection_id:
+        raise ShopifyPublishError(f"Shopify returned no ID for collection {title!r}.")
+    _checked(creds, "publishablePublish", _PUBLISH,
+             {"id": collection_id, "input": [{"publicationId": publication_id}]})
+    return collection_id
 
 
 def _single_variant(product: dict) -> dict:
@@ -253,6 +293,13 @@ def publish_product(creds: ShopifyCreds, path: Path, *,
             checked_variant.get("inventoryPolicy") != "DENY" or
             not checked_item.get("tracked") or checked_item.get("requiresShipping")):
         raise ShopifyPublishError("Shopify did not confirm the contact-only product settings.")
+
+    collections = _tags(meta.get("collections"))
+    if collections:
+        ids = [_ensure_collection(creds, title, publication_id) for title in collections]
+        _checked(creds, "productUpdate", _UPDATE,
+                 {"product": {"id": product_id, "collectionsToJoin": ids}})
+        result.collections = collections
 
     if result.status == "publish":
         _checked(creds, "publishablePublish", _PUBLISH,

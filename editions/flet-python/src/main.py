@@ -39,6 +39,7 @@ from tools import ToolContext, execute_tool, schemas_for, MUTATING_TOOLS
 import publish
 import shopify_publish
 import shopify_products
+import shopify_admin
 from models import (Agent, Turn, Thread, Area, Project, Task, Note, FileItem,
                     InboxItem, VaultEntry, OpenTab)
 from theme import (STATUS_COLORS, PLATINUM, _all_border, _bevel, _raised, _recessed, _sticky)
@@ -272,6 +273,10 @@ price_usd: 1.00           # catalog placeholder, NOT an agreed fee; default 1.00
 product_type: Service     # optional, default Service
 vendor: NoFate Technology # optional
 tags: [consulting]
+collections: [Consulting] # optional; created + published if missing
+handle: systems-diagnosis # optional URL slug
+seo_title: ...            # optional search title / description
+seo_description: ...
 ---
 # Offer Title
 Who it helps, the scope, the outcome, and the next step.
@@ -283,7 +288,8 @@ Who it helps, the scope, the outcome, and the next step.
 - One variant, zero tracked inventory, no shipping: the buy button is disabled
   and visitors inquire instead. Never put payment terms in the listing.
 - `audience:` private/subscribers/members/paid blocks going live (products are public).
-- Images are managed in Shopify and preserved on update; local images aren't uploaded.
+- Collections are join-only: removing one from the list doesn't remove the product.
+- Images: publish first, then shopify_upload_image(image, product_note=...).
 - Written back: shopify_product_id, shopify_store, shopify_published_url.
 
 **Blog post** (any other note type, e.g. `type: note`), goes to the configured blog:
@@ -301,6 +307,35 @@ Body in Markdown.
   published URL and published_at. A note is either a product or an article,
   never both.
 - WordPress only: optional visibility (public/private/password) + password args.
+
+**Shopify page** (`type: page`), an Online Store page (about, services, landing):
+```
+---
+type: page
+publish: draft
+handle: services          # optional URL slug → /pages/services
+template: landing         # optional theme template suffix (page.landing.json)
+---
+# Page Title
+Body in Markdown. Images: upload with shopify_upload_image, embed the returned URL.
+```
+- Written back: shopify_page_id, shopify_published_url.
+"""
+
+_SHOPIFY_GUIDE = """
+## Shopify store
+You can manage the connected Shopify store with the shopify_* tools:
+- shopify_query: read-only Admin GraphQL for anything (orders, customers, menus,
+  analytics via shopifyqlQuery, settings). Check real data before advising.
+- shopify_status: which vault notes are out of sync with the store, and store
+  items no note owns. Run it before bulk publishing and after store edits.
+- shopify_unpublish: take a product/article/page down (never deletes).
+- shopify_upload_image: attach images to products, or get a CDN URL for pages.
+- Themes: shopify_theme_files reads; edits go ONLY to a copy. Flow:
+  shopify_theme_duplicate → shopify_theme_write on the copy → give the preview URL.
+  The user publishes themes in Shopify admin. Read a file before rewriting it.
+The vault note is the source of truth for products, articles and pages. Change
+the note and publish_note it; don't edit those items in the store directly.
 """
 
 
@@ -349,6 +384,7 @@ def build_messages_for_general_agent(
     tools_available: bool = False,
     delegate_available: bool = False,
     publish_available: bool = False,
+    shopify_available: bool = False,
     system_override: Optional[str] = None,
 ) -> list[dict]:
     """Single-agent chat (v0.2): one system prompt assembled from an optional user
@@ -394,6 +430,8 @@ def build_messages_for_general_agent(
             )
         if publish_available:
             parts.append(_PUBLISHING_GUIDE)
+        if shopify_available:
+            parts.append(_SHOPIFY_GUIDE)
 
     others = [a for a in persona_library if a.name != general.name]
     if others:
@@ -3244,6 +3282,20 @@ class WorkbenchApp:
             tag_exclude=excl, visibility=visibility, password=password,
         )
 
+    def _shopify_tool_fn(self):
+        """Callable for the shopify_* agent tools, or None when publishing is off
+        or Shopify isn't connected (then the tools aren't advertised)."""
+        cfg = self.state.config
+        if not cfg.publish_enabled:
+            return None
+        creds = shopify_publish.creds_from_config(cfg)
+        try:
+            creds.validate()
+        except shopify_publish.ShopifyPublishError:
+            return None
+        vault = VAULT_PATH
+        return lambda name, args: shopify_admin.run_tool(name, args, creds, vault)
+
     def _tool_publish_note(self, args: dict) -> str:
         """Executor for the agent's `publish_note` tool (wired into ToolContext).
         Runs on the dispatch worker thread, so the synchronous network publish is
@@ -3262,6 +3314,16 @@ class WorkbenchApp:
             note_meta = frontmatter.load(str(path)).metadata
         except Exception as ex:
             return f"[publish_note: could not read note: {ex}]"
+        if str(note_meta.get("type") or "").strip().lower() == "page":
+            try:
+                page_creds = shopify_publish.creds_from_config(cfg)
+                page_creds.validate()
+                return shopify_admin.publish_page(
+                    page_creds, path, str(args["status"]) if args.get("status") else None)
+            except shopify_publish.ShopifyPublishError as ex:
+                return f"[publish_note failed: {ex}]"
+            except Exception as ex:
+                return f"[publish_note error: {ex}]"
         if str(note_meta.get("type") or "").strip().lower() == "product":
             if args.get("visibility") or args.get("password"):
                 return "[publish_note: Shopify products do not support subscriber visibility]"
@@ -7746,6 +7808,7 @@ class WorkbenchApp:
             tools_available=cfg.tools_enabled,
             delegate_available=cfg.tools_enabled and cfg.delegate_enabled,
             publish_available=cfg.tools_enabled and cfg.publish_enabled,
+            shopify_available=cfg.tools_enabled and self._shopify_tool_fn() is not None,
         )
         return msgs[0]["content"]
 
@@ -7838,6 +7901,7 @@ class WorkbenchApp:
             tools_available=cfg.tools_enabled,
             delegate_available=cfg.tools_enabled and cfg.delegate_enabled,
             publish_available=cfg.tools_enabled and cfg.publish_enabled,
+            shopify_available=cfg.tools_enabled and self._shopify_tool_fn() is not None,
             system_override=thread.system_prompt_override,
         )
         self._dump_prompt(messages, general.model)
@@ -7871,6 +7935,7 @@ class WorkbenchApp:
             delegate_timeout=cfg.delegate_timeout,
             publish_enabled=cfg.publish_enabled,
             publish_fn=self._tool_publish_note,
+            shopify_fn=self._shopify_tool_fn(),
         )
         tools = schemas_for(tool_ctx) if cfg.tools_enabled else None
 

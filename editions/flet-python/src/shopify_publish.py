@@ -191,6 +191,9 @@ def build_article(path: Path, blog_id: str, author: str,
     meta, body = post.metadata, post.content or ""
     if str(meta.get("type") or "").strip().lower() == "product":
         raise ShopifyPublishError("Use the Shopify product publisher for `type: product` notes.")
+    if str(meta.get("type") or "").strip().lower() == "page" or meta.get("shopify_page_id"):
+        raise ShopifyPublishError("This is a Shopify page note; publish it with the chat "
+                                  "agent's publish_note tool, not as a blog article.")
     if meta.get("shopify_product_id"):
         raise ShopifyPublishError("This note is linked to a Shopify product, not a blog article.")
     title = str(meta.get("title") or "").strip()

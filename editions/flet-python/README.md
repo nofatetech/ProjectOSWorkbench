@@ -138,6 +138,29 @@ variants or nonzero inventory. A product note marked private or subscriber-only
 cannot go live. Product images remain managed in Shopify and are
 preserved during text/price updates. Local Markdown images are not uploaded.
 
+Product notes also accept `handle:`, `seo_title:`, `seo_description:` and
+`collections: [Name]`. Listed collections are created and published if they
+don't exist, and products are only ever added to them, never removed.
+
+### Shopify tools for the chat agent
+
+With publishing enabled and Shopify connected, the chat agent gets `shopify_*`
+tools, and `type: page` notes publish as Online Store pages via `publish_note`
+(fields: `handle:` and `template:`, the theme template suffix):
+
+| Tool | What it does |
+|---|---|
+| `shopify_query` | Read-only Admin GraphQL (mutations refused): orders, customers, menus, analytics, settings |
+| `shopify_status` | Vault notes vs store: live/draft drift, notes edited since their last push, unlinked store items |
+| `shopify_unpublish` | Product → draft/archived, article/page → hidden. Never deletes |
+| `shopify_upload_image` | Attach a vault image to a product, or upload it to Files and return its CDN URL |
+| `shopify_theme_files` | List or read theme files (live theme by default) |
+| `shopify_theme_duplicate` / `shopify_theme_write` | Edit a *copy* of a theme; writes to the live theme are refused. You publish themes in Shopify admin |
+
+These need the app scopes for content, online store pages, products,
+publications, files and themes. The mutating tools are covered by the
+optional tool-confirm dialog.
+
 Example note:
 
 ```markdown
@@ -314,6 +337,7 @@ conversation is a `parent_id` tree (branches, pins, regenerate).
 | `publish.py` | WordPress.com publishing (existing destination) |
 | `shopify_publish.py` | Shopify blog publishing and shared API connection |
 | `shopify_products.py` | Contact-first Shopify product publishing and frontmatter writeback |
+| `shopify_admin.py` | Agent Shopify tools: read-only queries, sync status, pages, unpublish, images, theme files |
 | `views/people.py` | the People directory view |
 | `store.py` | thread persistence (JSON) |
 | `config.py` | `~/.workbench/config.json` + title-theme presets |
