@@ -253,6 +253,57 @@ def _vault_index_block(tools_available: bool) -> str:
             "reading notes. " + how + "\n\n" + body)
 
 
+# Prompt section for publish_note — the note formats the publishers accept, so the
+# agent can draft a note that publishes cleanly first time. Keep in sync with
+# shopify_products.build_product / shopify_publish.build_article.
+_PUBLISHING_GUIDE = """
+## Publishing
+publish_note(path) publishes a vault note to the web; re-publishing updates the
+same remote item (IDs are written back into the note's frontmatter, never edit
+them). Draft-first: pass status="publish" only when the user says to go live.
+Tags = the note's `tags:` + its project name, set automatically.
+
+**Shopify product** (`type: product`), a contact-first inquiry listing:
+```
+---
+type: product
+publish: draft            # draft | publish (live in the Online Store)
+price_usd: 1.00           # catalog placeholder, NOT an agreed fee; default 1.00
+product_type: Service     # optional, default Service
+vendor: NoFate Technology # optional
+tags: [consulting]
+---
+# Offer Title
+Who it helps, the scope, the outcome, and the next step.
+```
+- Title = `title:` in frontmatter, else the first H1, else the filename.
+- Body becomes the product description; a "Contact us about this offer" link and
+  a placeholder-price notice are prepended automatically. A description is
+  required before going live. Wikilinks become plain text.
+- One variant, zero tracked inventory, no shipping: the buy button is disabled
+  and visitors inquire instead. Never put payment terms in the listing.
+- `audience:` private/subscribers/members/paid blocks going live (products are public).
+- Images are managed in Shopify and preserved on update; local images aren't uploaded.
+- Written back: shopify_product_id, shopify_store, shopify_published_url.
+
+**Blog post** (any other note type, e.g. `type: note`), goes to the configured blog:
+```
+---
+type: note
+publish: draft
+summary: One-line excerpt shown in listings   # optional (or description:)
+tags: [media]
+---
+# Post Title
+Body in Markdown.
+```
+- Restricted `audience:` blocks going live. Written back: the article/post ID,
+  published URL and published_at. A note is either a product or an article,
+  never both.
+- WordPress only: optional visibility (public/private/password) + password args.
+"""
+
+
 def _history_messages(history: list["Turn"]) -> list[dict]:
     """Serialize thread history to chat messages. A team turn that ran tools is
     replayed as the genuine exchange — an assistant `tool_calls` message, then a
@@ -314,6 +365,7 @@ def build_messages_for_general_agent(
     if system_preamble.strip():
         parts.append(system_preamble.strip())
     parts.append(general.role)
+    parts.append(f"\nToday is {date.today():%A %Y-%m-%d}.")
     base = _system_note_body(BASE_PROMPT_NOTE)
     if base:
         parts.append("\n" + base)
@@ -341,14 +393,7 @@ def build_messages_for_general_agent(
                 "Use this for real code changes; run_shell is for quick one-offs."
             )
         if publish_available:
-            parts.append(
-                "\nTo publish a note to the web, call publish_note(path). A note "
-                "with type: product becomes a contact-first Shopify product; post "
-                "and journal notes use the configured blog. Publishing is draft-first "
-                "and re-publishing updates the same remote item. Tags come from the "
-                "note and project. Optional: status (draft/publish). WordPress also supports "
-                "visibility (public/private/password)."
-            )
+            parts.append(_PUBLISHING_GUIDE)
 
     others = [a for a in persona_library if a.name != general.name]
     if others:
