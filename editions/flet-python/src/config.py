@@ -21,6 +21,10 @@ class Config:
     vault_path: str = ""
     openrouter_api_key: str = ""
     ollama_base_url: str = "http://localhost:11434/v1"
+    # Codex CLI chat backend (chat_model "codex" or "codex/<model>"): runs on the
+    # CLI's own login (e.g. ChatGPT plan), no API key. Effort: low|medium|high|"".
+    codex_command: str = "codex"
+    codex_reasoning_effort: str = "medium"
     # When True, ALL agent calls route through MockBrain regardless of the agent's
     # `model:` prefix. Useful during dev to avoid burning OpenRouter tokens on
     # every UI change.

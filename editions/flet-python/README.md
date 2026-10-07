@@ -190,6 +190,7 @@ The model string's prefix decides where a call goes:
 | --- | --- | --- |
 | `mock/<anything>` | `MockBrain` (instant fake) | `mock/test` |
 | `ollama/<model>` | local Ollama (`ollama_base_url`) | `ollama/qwen2.5:3b` |
+| `codex` / `codex/<model>` | Codex CLI on its own login (ChatGPT plan, no API key) | `codex/gpt-5.6-luna` |
 | `openrouter/<provider>/<model>` | OpenRouter | `openrouter/anthropic/claude-opus-4-7` |
 | `<provider>/<model>` (no prefix) | OpenRouter (default) | `anthropic/claude-opus-4-7` |
 
@@ -197,6 +198,17 @@ The model string's prefix decides where a call goes:
 quality varies by model: frontier models (Opus, etc.) call tools reliably; small
 local models may narrate actions instead of calling the tool. Pick a strong
 model as your `chat_model` if you rely on the file/shell tools.
+
+**Codex backend.** `codex` runs each chat turn through `codex exec --json`,
+using the CLI's own login with no API key. Codex runs its own tool loop:
+Workbench's tools (vault, `publish_note`, `shopify_*`) reach it through
+`codex_mcp_bridge.py`, a stdio MCP server that forwards each call to a
+per-turn localhost endpoint in the app. Calls still go through the confirm
+dialog and show as inline markers. Codex's own shell is sandboxed read-only
+in the vault, and your `~/.codex/config.toml` is ignored, so its plugins
+don't load. Settings: `codex_command` and `codex_reasoning_effort`
+(default `medium`). Replies arrive as whole messages, not token streams, and
+each turn resends the whole thread.
 
 ## Agents
 
@@ -331,7 +343,8 @@ conversation is a `parent_id` tree (branches, pins, regenerate).
 | --- | --- |
 | `main.py` | the Flet app — views, state, dispatch, all UI |
 | `models.py` | data model (Project, Thread, Turn, …) |
-| `brain.py` | model routing + streaming (Mock / OpenRouter / Ollama) + tool-call parsing |
+| `brain.py` | model routing + streaming (Mock / OpenRouter / Ollama / Codex CLI) + tool-call parsing |
+| `codex_mcp_bridge.py` | stdio MCP server exposing Workbench tools to the Codex CLI |
 | `tools.py` | the agent's tool registry + execution + CLI delegation |
 | `vault.py` | read/write/scan layer over the vault |
 | `publish.py` | WordPress.com publishing (existing destination) |

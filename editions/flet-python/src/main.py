@@ -31,7 +31,7 @@ import frontmatter
 
 import json
 
-from brain import brain_for, clamp_max_tokens
+from brain import CodexBrain, brain_for, clamp_max_tokens
 from config import (CONFIG_PATH, load_config, save_config,
                     load_telegram_cfg, save_telegram_cfg, load_title_themes)
 from store import save_thread, load_thread_dicts
@@ -1433,6 +1433,8 @@ class WorkbenchApp:
         # *selection*, so free-typed slugs were silently dropped (fell back to
         # the seeded default on save). A plain TextField captures them reliably.
         common_models = [
+            "codex",
+            "codex/gpt-5.6-luna",
             "anthropic/claude-opus-4-8",
             "anthropic/claude-opus-4-7",
             "anthropic/claude-sonnet-4-6",
@@ -6656,6 +6658,8 @@ class WorkbenchApp:
                                 size=12, color=ft.Colors.OUTLINE),
                         ft.Text("  ollama/<model-name>       → local Ollama (offline; e.g. ollama/qwen2.5:3b)",
                                 size=12, color=ft.Colors.OUTLINE),
+                        ft.Text("  codex | codex/<model>     → Codex CLI on its own login (ChatGPT plan, no API key)",
+                                size=12, color=ft.Colors.OUTLINE),
                         ft.Text("  openrouter/<provider>/<model>  → OpenRouter",
                                 size=12, color=ft.Colors.OUTLINE),
                         ft.Text("  <provider>/<model>        → OpenRouter (default)",
@@ -7939,10 +7943,41 @@ class WorkbenchApp:
         )
         tools = schemas_for(tool_ctx) if cfg.tools_enabled else None
 
+        def run_tool_call(call_id: str, name: str, arguments: str) -> str:
+            """Execute one tool call with the live-turn marker + confirm gate.
+            Used by the function-calling loop below and, for CodexBrain, by its
+            MCP bridge endpoint (Codex runs its own loop)."""
+            try:
+                args = json.loads(arguments or "{}")
+            except Exception:
+                args = {}
+            # Record the call now (result filled in after) so the live
+            # turn shows it; persisted on team_turn for faithful replay.
+            # text_offset anchors the call to its spot in the streamed
+            # text so the turn can show an inline marker right where the
+            # agent paused to use the tool (mid-sentence flow).
+            with lock:
+                step = {"id": call_id, "name": name,
+                        "arguments": arguments or "{}", "result": "…",
+                        "text_offset": len(accumulated[0])}
+                team_turn.tool_steps.append(step)
+            render()
+            if self._ask_tool_permission(thread, name, args):
+                result = execute_tool(name, args, tool_ctx)
+            else:
+                result = "[user declined this action]"
+            with lock:
+                step["result"] = result
+            render()
+            return result
+
         def run():
             try:
                 model_str = (self.state.config.chat_model or "").strip() or general.model
                 brain, model = brain_for(model_str, self.state.config)
+                if isinstance(brain, CodexBrain):
+                    brain.tool_executor = lambda name, args: run_tool_call(
+                        "call_" + uuid.uuid4().hex[:12], name, json.dumps(args))
                 eff_max_tokens = clamp_max_tokens(model, max_tokens)
                 if eff_max_tokens != max_tokens:
                     self._trace(f"dispatch: clamped max_tokens {max_tokens} → "
@@ -7977,28 +8012,7 @@ class WorkbenchApp:
                         ],
                     })
                     for c in calls:
-                        try:
-                            args = json.loads(c["arguments"] or "{}")
-                        except Exception:
-                            args = {}
-                        # Record the call now (result filled in after) so the live
-                        # turn shows it; persisted on team_turn for faithful replay.
-                        # text_offset anchors the call to its spot in the streamed
-                        # text so the turn can show an inline marker right where the
-                        # agent paused to use the tool (mid-sentence flow).
-                        with lock:
-                            step = {"id": c["id"], "name": c["name"],
-                                    "arguments": c["arguments"] or "{}", "result": "…",
-                                    "text_offset": len(accumulated[0])}
-                            team_turn.tool_steps.append(step)
-                        render()
-                        if self._ask_tool_permission(thread, c["name"], args):
-                            result = execute_tool(c["name"], args, tool_ctx)
-                        else:
-                            result = "[user declined this action]"
-                        with lock:
-                            step["result"] = result
-                        render()
+                        result = run_tool_call(c["id"], c["name"], c["arguments"])
                         convo.append({"role": "tool", "tool_call_id": c["id"],
                                       "content": result})
             except Exception as ex:
